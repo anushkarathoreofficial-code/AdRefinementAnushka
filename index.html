@@ -53,15 +53,15 @@
     --orange-bg: rgba(198,114,22,.14);
     --gray: #bcbcbc;
   }
-  body.light-mode .header { background:linear-gradient(135deg, #ffffff 0%, #fff9d6 100%); }
+  body.light-mode .header { background:var(--surface); }
   body.light-mode .score-circle.score-5, body.light-mode .score-circle.score-4 { color:#1a6b28; }
   body.light-mode .score-circle.score-3, body.light-mode .score-circle.score-2 { color:#8a6200; }
   body.light-mode .score-circle.score-1, body.light-mode .score-circle.score-0 { color:#9a2020; }
   * { margin:0; padding:0; box-sizing:border-box; }
   body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height:100vh; }
 
-  .header { padding: 20px 32px; border-bottom: 1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; background:linear-gradient(135deg, #111111 0%, #1a1a0a 100%); }
-  .header h1 { font-size: 22px; font-weight: 700; }
+  .header { padding: 18px 32px; border-bottom: 1px solid var(--border); display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:12px; background:var(--surface); }
+  .header h1 { font-size: 20px; font-weight: 600; letter-spacing:-.01em; }
   .header h1 span { color: var(--accent); }
   .header-right { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
   .badge { font-size:12px; padding:4px 10px; border-radius:20px; font-weight:600; }
@@ -162,59 +162,74 @@
   @media (max-width:1100px) { .cards-grid { grid-template-columns:repeat(2, 1fr); } }
   @media (max-width:720px)  { .cards-grid { grid-template-columns:1fr; } }
 
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; transition:all .15s; }
-  .card:hover { border-color:var(--accent); box-shadow:0 4px 14px rgba(240,223,32,.06); }
+  /* Card — calmer borders, no hover glow. Border-only hover state. */
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; transition:border-color .15s; }
+  .card:hover { border-color:rgba(240,223,32,.3); }
 
-  .card-header { padding:10px 12px; display:flex; gap:10px; align-items:flex-start; border-bottom:1px solid var(--border); }
-  .card-thumb { width:72px; height:72px; border-radius:6px; flex-shrink:0; object-fit:cover; background:var(--surface2); cursor:pointer; display:block; }
-  .card-thumb-placeholder { width:72px; height:72px; border-radius:6px; flex-shrink:0; background:var(--surface2); display:flex; align-items:center; justify-content:center; font-size:22px; color:var(--text-dim); cursor:pointer; }
+  .card-header { padding:12px 14px; display:flex; gap:12px; align-items:center; border-bottom:1px solid var(--border); }
+  .card-thumb { width:64px; height:64px; border-radius:6px; flex-shrink:0; object-fit:cover; background:var(--surface2); cursor:pointer; display:block; }
+  .card-thumb-placeholder { width:64px; height:64px; border-radius:6px; flex-shrink:0; background:var(--surface2); display:flex; align-items:center; justify-content:center; font-size:20px; color:var(--text-dim); cursor:pointer; }
   .card-header-main { flex:1; min-width:0; }
-  .card-title { font-size:12.5px; font-weight:600; line-height:1.35; word-break:break-word; white-space:normal; }
+  .card-title { font-size:12.5px; font-weight:600; line-height:1.4; word-break:break-word; white-space:normal; color:var(--text); }
   .card-subtitle { font-size:11px; color:var(--text-dim); margin-top:2px; }
-  .score-circle { width:34px; height:34px; border-radius:50%; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:13px; }
-  .score-5 { background:var(--green-bg); color:var(--green); }
-  .score-4 { background:var(--green-bg); color:var(--green); }
-  .score-3 { background:var(--yellow-bg); color:var(--yellow); }
-  .score-2 { background:var(--yellow-bg); color:var(--yellow); }
-  .score-1 { background:var(--red-bg); color:var(--red); }
-  .score-0 { background:var(--red-bg); color:var(--red); }
 
-  /* Boxed metric tiles (original look) */
-  .card-metrics { padding:10px 14px; display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
-  .metric { text-align:center; padding:7px 3px; border-radius:6px; background:var(--surface2); }
-  .metric.pass { background:var(--green-bg); }
-  .metric.fail { background:var(--red-bg); }
-  .metric.na   { background:var(--surface2); }
-  .metric .m-label { display:block; font-size:9px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.35px; margin-bottom:2px; }
-  .metric .m-value { display:block; font-size:12.5px; font-weight:700; }
-  .metric.pass .m-value { color:var(--green); }
-  .metric.fail .m-value { color:var(--red); }
+  /* Score — outlined chip instead of filled circle. Quieter, glanceable. */
+  .score-circle {
+    width:auto; height:auto; padding:3px 9px; border-radius:6px;
+    font-weight:600; font-size:11px; letter-spacing:.2px;
+    background:transparent; border:1px solid var(--border);
+    display:inline-flex; align-items:center; justify-content:center;
+    white-space:nowrap;
+  }
+  .score-5, .score-4 { color:var(--green); border-color:rgba(92,214,92,.35); }
+  .score-3, .score-2 { color:var(--yellow); border-color:rgba(240,223,32,.35); }
+  .score-1, .score-0 { color:var(--red); border-color:rgba(255,107,107,.35); }
+
+  /* Metric tiles — colored backgrounds removed. Status conveyed via a
+     thin bottom underline; value color only changes for failures so the
+     eye is drawn to what needs attention rather than everything. */
+  .card-metrics { padding:12px 14px 14px; display:grid; grid-template-columns:repeat(5,1fr); gap:10px; }
+  .metric { text-align:center; padding:4px 2px 7px; background:transparent; position:relative; }
+  .metric::after { content:''; position:absolute; left:14%; right:14%; bottom:0; height:2px; border-radius:2px; background:var(--border); opacity:.6; }
+  .metric.pass::after { background:var(--green); opacity:.45; }
+  .metric.fail::after { background:var(--red);   opacity:.6; }
+  .metric.na::after   { background:var(--border); opacity:.3; }
+  .metric .m-label { display:block; font-size:9px; color:var(--text-dim); text-transform:uppercase; letter-spacing:.6px; margin-bottom:3px; font-weight:500; }
+  .metric .m-value { display:block; font-size:13px; font-weight:500; color:var(--text); }
+  .metric.pass .m-value { color:var(--text); }
+  .metric.fail .m-value { color:var(--red); font-weight:600; }
   .metric.na   .m-value { color:var(--text-dim); }
 
-  /* Modal metrics: larger boxed tiles */
-  .modal-metrics .metric { padding:10px 4px; }
-  .modal-metrics .metric .m-value { font-size:14px; }
+  /* Modal metrics — slightly larger and slightly more present since the
+     user is here to inspect details. Same restraint principles. */
+  .modal-metrics .metric { padding:6px 4px 10px; }
+  .modal-metrics .metric .m-value { font-size:15px; }
+  .modal-metrics .metric::after { left:18%; right:18%; height:2px; }
 
-  .card-refinement { padding:6px 12px 8px; border-top:1px solid var(--border); }
-  .refinement-tag { font-size:11px; color:var(--yellow); font-weight:600; }
+  /* Refinement — muted; the metric underlines already say what failed. */
+  .card-refinement { padding:6px 14px 10px; }
+  .refinement-tag { font-size:11px; color:var(--text-dim); font-weight:500; }
   .refinement-text { font-size:11px; color:var(--text-dim); line-height:1.5; margin-top:3px; }
 
-  .card-actions { padding:8px 12px; border-top:1px solid var(--border); display:flex; gap:6px; flex-wrap:wrap; }
-  .btn { padding:6px 12px; border-radius:6px; font-size:11px; font-weight:600; border:none; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:4px; transition:all .15s; }
-  .btn-preview { background:var(--blue-bg); color:var(--blue); }
-  .btn-preview:hover { background:rgba(96,165,250,.25); }
-  .btn-rework { background:var(--yellow-bg); color:var(--yellow); }
-  .btn-rework:hover { background:rgba(251,191,36,.25); }
+  /* Action buttons — outlined by default; Preview keeps the accent fill
+     so the primary CTA still reads as primary. */
+  .card-actions { padding:8px 14px 12px; display:flex; gap:6px; flex-wrap:wrap; }
+  .btn { padding:5px 12px; border-radius:6px; font-size:11px; font-weight:500; border:1px solid transparent; cursor:pointer; text-decoration:none; display:inline-flex; align-items:center; gap:4px; transition:all .15s; background:transparent; color:var(--text); }
+  .btn:hover { border-color:var(--border); background:var(--surface2); }
+  .btn-preview { background:transparent; color:var(--blue); border-color:rgba(125,184,240,.3); }
+  .btn-preview:hover { background:rgba(125,184,240,.08); border-color:var(--blue); }
+  .btn-rework { background:transparent; color:var(--yellow); border-color:rgba(240,223,32,.3); }
+  .btn-rework:hover { background:rgba(240,223,32,.08); border-color:var(--yellow); }
 
-  .priority-label { font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.4px; padding:2px 7px; border-radius:4px; }
-  .priority-high { background:var(--green-bg); color:var(--green); }
-  .priority-med { background:var(--yellow-bg); color:var(--yellow); }
-  .priority-low { background:var(--red-bg); color:var(--red); }
+  /* Priority + link status — small, no chip backgrounds. Just colored text. */
+  .priority-label { font-size:10px; font-weight:500; text-transform:uppercase; letter-spacing:.5px; padding:0; background:transparent; }
+  .priority-high { color:var(--green); }
+  .priority-med  { color:var(--yellow); }
+  .priority-low  { color:var(--red); }
 
-  /* Link match indicator */
-  .link-status { font-size:10px; margin-top:2px; }
-  .link-matched { color:var(--green); }
-  .link-missing { color:var(--text-dim); }
+  .link-status { font-size:10px; margin-top:2px; color:var(--text-dim); }
+  .link-matched { color:var(--text-dim); }
+  .link-missing { color:var(--text-dim); opacity:.6; }
 
   /* Modal */
   .modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.7); z-index:100; align-items:center; justify-content:center; }
@@ -508,7 +523,7 @@
   <h1><span>Astrotalk</span> Ad Refinement Dashboard</h1>
   <div class="header-right">
     <button id="btnRefreshData" onclick="refreshData()" title="Re-pull data from Google Sheets" style="padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;">↻ Refresh data</button>
-    <span style="font-size:11px; color:#000000; font-weight:700; margin-right:8px; border:1px solid var(--accent); padding:5px 12px; border-radius:6px; background:var(--accent);">Have suggestions? Tell Anushka Rathore now!</span>
+    <span style="font-size:11px; color:var(--text-dim); font-weight:500; margin-right:8px; padding:5px 10px; border-radius:6px; background:transparent;">Suggestions? Tell Anushka Rathore.</span>
 
     <!-- Hamburger menu — hover or click to reveal tab navigation -->
     <div class="menu-trigger" id="navMenu">
