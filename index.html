@@ -519,47 +519,6 @@
   <!-- ===== TAB: CREATIVES ===== -->
   <div class="tab-content active" id="tab-creatives">
 
-    <div class="stats-bar" id="statsBar">
-      <div class="stat-card">
-        <div class="label">Total Creatives</div>
-        <div class="value" id="statTotal">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">All Benchmarks Met</div>
-        <div class="value" style="color:var(--green)" id="statPassing">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Refineable (3-4 met)</div>
-        <div class="value" style="color:var(--yellow)" id="statRefine">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Needs Rethink (0-2)</div>
-        <div class="value" style="color:var(--red)" id="statRethink">0</div>
-      </div>
-      <div class="stat-card">
-        <div class="label">Avg Score</div>
-        <div class="value" style="color:var(--accent)" id="statAvg">0/5</div>
-      </div>
-    </div>
-
-    <!-- Link match banner -->
-    <div class="match-banner" id="matchBanner" style="display:none;">
-      <div class="match-banner-inner">
-        <span><span class="matched" id="matchedCount">0</span> creatives matched with Drive links</span>
-        <span id="matchBreakdown" style="font-size:11px; color:var(--text-dim); margin-left:8px;"></span>
-        <span class="unmatched" id="unmatchedCount">0 without links</span>
-      </div>
-    </div>
-
-    <div class="benchmarks-ref" id="benchmarksRef">
-      <span style="font-size:11px; color:var(--text-dim); font-weight:600;">Benchmarks:</span>
-      <span class="bench-tag">CPI <b>&lt; ₹350</b></span>
-      <span class="bench-tag">Hold Rate <b>&gt; 40%</b></span>
-      <span class="bench-tag">Hook Rate <b>&gt; 30%</b></span>
-      <span class="bench-tag">CTI <b>&gt; 20%</b></span>
-      <span class="bench-tag">CPM <b>&lt; ₹1500</b></span>
-    </div>
-
     <div class="top-controls">
       <input type="text" class="search-input" id="searchInput" placeholder="Search ad name...">
       <select class="sort-select" id="sortSelect">
@@ -694,18 +653,6 @@
       <!-- Display preferences -->
       <div class="ai-settings" id="displaySettings" style="margin-bottom:12px; flex-wrap:wrap; gap:14px 18px;">
         <label>Display</label>
-        <label style="display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text); cursor:pointer;">
-          <input type="checkbox" id="hideStatsBarToggle" onchange="onHideStatsBarChange()">
-          Hide summary stats (Total / Passing / Refineable / Rethink / Avg)
-        </label>
-        <label style="display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text); cursor:pointer;">
-          <input type="checkbox" id="hideMatchBannerToggle" onchange="onHideMatchBannerChange()">
-          Hide the "creatives matched with Drive links" bar
-        </label>
-        <label style="display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text); cursor:pointer;">
-          <input type="checkbox" id="hideBenchmarksRefToggle" onchange="onHideBenchmarksRefChange()">
-          Hide benchmarks reference row (CPI / Hold / Hook / CTI / CPM)
-        </label>
         <label style="display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text); cursor:pointer;">
           <input type="checkbox" id="compactCardsToggle" onchange="onCompactCardsChange()">
           Compact card view (hide per-card metric tiles)
@@ -1506,38 +1453,6 @@ function renderDashboard() {
     });
   }
   else if (sort === 'name') filtered.sort((a, b) => a.name.localeCompare(b.name));
-
-  // Stats
-  const passing = allAds.filter(a => a.score === 5).length;
-  const refine = allAds.filter(a => a.score >= 3 && a.score <= 4).length;
-  const rethink = allAds.filter(a => a.score <= 2).length;
-  const avg = allAds.length ? (allAds.reduce((s, a) => s + a.score, 0) / allAds.length).toFixed(1) : 0;
-
-  document.getElementById('statTotal').textContent = allAds.length;
-  document.getElementById('statPassing').textContent = passing;
-  document.getElementById('statRefine').textContent = refine;
-  document.getElementById('statRethink').textContent = rethink;
-  document.getElementById('statAvg').textContent = avg + '/5';
-
-  // Link match banner — break down exact vs fuzzy so the user can see how
-  // many matches came from name-similarity rather than identical strings.
-  const withLink = allAds.filter(a => a.link).length;
-  const withoutLink = allAds.length - withLink;
-  const exactCount = allAds.filter(a => a.linkMatch && a.linkMatch.matchType === 'exact').length;
-  const fuzzyCount = allAds.filter(a => a.linkMatch && a.linkMatch.matchType === 'fuzzy').length;
-  if ((Object.keys(linkMap).length > 0 || withLink > 0) && !isMatchBannerHidden()) {
-    document.getElementById('matchBanner').style.display = 'block';
-    document.getElementById('matchedCount').textContent = withLink + ' / ' + allAds.length;
-    const breakdown = document.getElementById('matchBreakdown');
-    if (breakdown) {
-      const parts = [];
-      if (exactCount) parts.push(exactCount + ' exact');
-      if (fuzzyCount) parts.push(fuzzyCount + ' fuzzy');
-      breakdown.textContent = parts.length ? '(' + parts.join(' · ') + ')' : '';
-    }
-    document.getElementById('unmatchedCount').textContent = withoutLink > 0 ? withoutLink + ' without links' : 'All matched!';
-    document.getElementById('unmatchedCount').style.color = withoutLink > 0 ? 'var(--yellow)' : 'var(--green)';
-  }
 
   // Cards
   const grid = document.getElementById('cardsGrid');
@@ -4137,42 +4052,20 @@ function _getPref(key) {
 function _setPref(key, on) {
   try { localStorage.setItem(key, on ? '1' : '0'); } catch (_) {}
 }
-function isMatchBannerHidden()   { return _getPref('hideMatchBanner'); }
-function isStatsBarHidden()      { return _getPref('hideStatsBar'); }
-function isBenchmarksRefHidden() { return _getPref('hideBenchmarksRef'); }
-function isCompactCards()        { return _getPref('compactCards'); }
-function isListView()            { return _getPref('listView'); }
+function isCompactCards() { return _getPref('compactCards'); }
+function isListView()     { return _getPref('listView'); }
 
 function applyDisplayPrefs() {
-  // Sync checkboxes with stored prefs
-  const cbMatch    = document.getElementById('hideMatchBannerToggle');
-  const cbStats    = document.getElementById('hideStatsBarToggle');
-  const cbBench    = document.getElementById('hideBenchmarksRefToggle');
-  const cbCompact  = document.getElementById('compactCardsToggle');
-  const cbList     = document.getElementById('listViewToggle');
-  if (cbMatch)   cbMatch.checked   = isMatchBannerHidden();
-  if (cbStats)   cbStats.checked   = isStatsBarHidden();
-  if (cbBench)   cbBench.checked   = isBenchmarksRefHidden();
+  const cbCompact = document.getElementById('compactCardsToggle');
+  const cbList    = document.getElementById('listViewToggle');
   if (cbCompact) cbCompact.checked = isCompactCards();
   if (cbList)    cbList.checked    = isListView();
-
-  // Apply to DOM
-  const stats  = document.getElementById('statsBar');
-  const banner = document.getElementById('matchBanner');
-  const bench  = document.getElementById('benchmarksRef');
-  if (stats)  stats.style.display  = isStatsBarHidden()      ? 'none' : '';
-  if (bench)  bench.style.display  = isBenchmarksRefHidden() ? 'none' : '';
-  if (banner && isMatchBannerHidden()) banner.style.display = 'none';
   document.body.classList.toggle('compact-cards', isCompactCards());
   document.body.classList.toggle('list-view',     isListView());
-  // Match banner re-appears via renderDashboard() when unhidden + links exist.
 }
 
-function onHideMatchBannerChange()   { _setPref('hideMatchBanner',   document.getElementById('hideMatchBannerToggle').checked);   applyDisplayPrefs(); if (typeof renderDashboard === 'function') renderDashboard(); }
-function onHideStatsBarChange()      { _setPref('hideStatsBar',      document.getElementById('hideStatsBarToggle').checked);      applyDisplayPrefs(); }
-function onHideBenchmarksRefChange() { _setPref('hideBenchmarksRef', document.getElementById('hideBenchmarksRefToggle').checked); applyDisplayPrefs(); }
-function onCompactCardsChange()      { _setPref('compactCards',      document.getElementById('compactCardsToggle').checked);      applyDisplayPrefs(); }
-function onListViewChange()          { _setPref('listView',          document.getElementById('listViewToggle').checked);          applyDisplayPrefs(); }
+function onCompactCardsChange() { _setPref('compactCards', document.getElementById('compactCardsToggle').checked); applyDisplayPrefs(); }
+function onListViewChange()     { _setPref('listView',     document.getElementById('listViewToggle').checked);     applyDisplayPrefs(); }
 function getSheetWebhook() { return Store.get('sheet_webhook') || ''; }
 function getSlackWebhook() { return Store.get('slack_webhook') || ''; }
 
