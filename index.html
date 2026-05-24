@@ -1493,6 +1493,7 @@ async function loadFromBackend() {
     if (!ads.length) throw new Error('Meta sheet has no rows. Check that the sheet has Ad Name + CPI/Hook/Hold/CTI/CPM columns.');
     ads.forEach((ad, i) => ad.id = i + 1);
     allAds = ads;
+    bumpVariationCacheVersion();
     metaCSVLoaded = true;
 
     launchDashboard();
@@ -2983,6 +2984,7 @@ Astro_UGC_Marriage_v2,https://drive.google.com/file/d/demo_ugc_m2/view`;
   linkMap = parseLinkCSV(demoLinkCSV);
   linksLoaded = true;
   allAds = parseMetaCSV(demoMetaCSV);
+  bumpVariationCacheVersion();
   metaCSVLoaded = true;
   rematchLinks();
 
@@ -3232,13 +3234,55 @@ function downloadDiagnoseCSV(items, name) {
 }
 
 // ============ VARIATIONS PANEL ============
-// Strict name-similarity clustering: pairs only count as variations if they
-// differ by at most ~2 tokens AND both dice + jaccard signals agree on high
-// similarity. So "Pickleball cut 2|V1|Aditya" matches "Pickleball cut 2|V2|
-// Aditya" but unrelated ads sharing one or two common tokens don't get
-// pulled in. Sorted by CPI ascending so V1 = best (lowest) CPI in the group.
-const _VAR_SIMILARITY_THRESHOLD = 0.7;   // both dice & jaccard must exceed this
-const _VAR_MAX_TOKEN_DIFF       = 3;     // distinct tokens between names
+// Match on the HOOK only (the opening phrase of the ad title, before the
+// first major separator like "|"). Emojis, creator-name suffixes, PPP/AAAT
+// tags, "Copy" suffixes, and version markers are stripped before comparison.
+// Two ads cluster as variants only when their hooks are very close (high
+// dice + jaccard AND only 1-2 distinct tokens between them). Sorted by CPI
+// ascending so V1 = best (lowest) CPI in the group.
+const _VAR_SIMILARITY_THRESHOLD = 0.7;
+const _VAR_MAX_TOKEN_DIFF       = 2;
+const _VAR_MIN_HOOK_TOKENS      = 2;
+
+// Extract the hook from an ad name:
+//   1. Strip emojis & pictographs
+//   2. Take the prefix up to the first "|" / "[" / "(" / "—" separator
+//      (these conventionally split title from creator/version metadata)
+//   3. Pass through normalizeAdName to drop "Copy", unify dashes, etc.
+function extractHook(name) {
+  if (!name) return '';
+  let s = String(name)
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2700}-\u{27BF}\u{1F000}-\u{1F2FF}]/gu, '')
+    .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '')   // variation selectors + ZWJ
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '');                // flag halves
+  // Take the prefix up to the first | / [ / ( / — (em dash) / – (en dash)
+  const sepMatch = s.match(/[|\[\(–—]/);
+  if (sepMatch && sepMatch.index >= 4) s = s.slice(0, sepMatch.index);
+  // Drop trailing version / copy markers ONLY. "cut N" is preserved because
+  // it usually denotes a distinct cut of footage, not a variation marker —
+  // "Pickleball cut 2" and "Pickleball cut 3" should NOT cluster as variants.
+  s = s.replace(/[\s_\-]*(?:v\d+|ver\d+|version\s*\d+|copy(?:\s*\d+)?)[\s_\-]*$/gi, '');
+  return normalizeAdName(s);
+}
+
+// Precompute hooks + their bigrams/tokens once per allAds change; cache by
+// ad id so repeated openModal calls don't recompute. Bumped on every data
+// load / refresh via bumpVariationCacheVersion() to avoid stale entries.
+let _variationDataVersion = 0;
+function bumpVariationCacheVersion() { _variationDataVersion++; _variationHookCache.byId.clear(); }
+let _variationHookCache = { byId: new Map() };
+function _getHookIndex(ad) {
+  let entry = _variationHookCache.byId.get(ad.id);
+  if (entry) return entry;
+  const hook = extractHook(ad.name);
+  entry = {
+    hook,
+    bigrams: _bigrams(hook),
+    tokens:  new Set(_tokensFor(hook))
+  };
+  _variationHookCache.byId.set(ad.id, entry);
+  return entry;
+}
 
 function _tokenDiff(setA, setB) {
   let onlyA = 0, onlyB = 0;
@@ -3249,20 +3293,19 @@ function _tokenDiff(setA, setB) {
 
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
-  const seedKey     = normalizeAdName(seedAd.name);
-  const seedBigrams = _bigrams(seedKey);
-  const seedTokens  = new Set(_tokensFor(seedAd.name));
+  const seedIdx = _getHookIndex(seedAd);
+  // Hooks shorter than the minimum aren't reliable enough to cluster on —
+  // would false-match too many unrelated ads.
+  if (seedIdx.tokens.size < _VAR_MIN_HOOK_TOKENS) return [];
 
   const matches = [];
   for (const ad of allAds) {
     if (ad.id === seedAd.id) { matches.push({ ad, score: 1, isSelf: true }); continue; }
-    const otherKey     = normalizeAdName(ad.name);
-    const otherBigrams = _bigrams(otherKey);
-    const otherTokens  = new Set(_tokensFor(ad.name));
-    const dice = _diceFromBigrams(seedBigrams, otherBigrams);
-    const jacc = _jaccard(seedTokens, otherTokens);
-    const diff = _tokenDiff(seedTokens, otherTokens);
-    // Strict: BOTH signals high AND few tokens differ.
+    const otherIdx = _getHookIndex(ad);
+    if (otherIdx.tokens.size < _VAR_MIN_HOOK_TOKENS) continue;
+    const dice = _diceFromBigrams(seedIdx.bigrams, otherIdx.bigrams);
+    const jacc = _jaccard(seedIdx.tokens, otherIdx.tokens);
+    const diff = _tokenDiff(seedIdx.tokens, otherIdx.tokens);
     if (dice >= _VAR_SIMILARITY_THRESHOLD &&
         jacc >= _VAR_SIMILARITY_THRESHOLD &&
         diff <= _VAR_MAX_TOKEN_DIFF) {
@@ -3329,7 +3372,7 @@ function renderVariationsPanel(seedAdId) {
     <div class="variations-panel">
       <div class="var-header">
         <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">Ranked by CPI low → high · click any row to open</span>
+        <span class="var-hint">Grouped by opening hook · ranked by CPI low → high</span>
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
