@@ -2363,26 +2363,16 @@ function openModal(id) {
       if (slot) slot.innerHTML = `<div style="display:flex; align-items:center; justify-content:center; min-height:300px; background:#000; color:var(--text-dim); font-size:13px;">Locating video inside Drive folder…</div>`;
       if (hint) hint.innerHTML = '';
 
-      resolveFolderToVideo(folderId).then(resolvedId => {
+      resolveFolderToVideo(folderId).then(async resolvedId => {
         if (currentModalAdId !== id) return;
         if (!resolvedId) {
-          // Folder is most likely not shared "Anyone with the link" so the
-          // public API can't see its contents. Show actionable guidance
-          // instead of the broken folder iframe.
+          // resolveFolderToVideo returned null — could be private, empty,
+          // API key restriction, or quota. Diagnose live so the user
+          // sees the actual root cause instead of a generic message.
+          const diag = await diagnoseSpecificFolder(folderId);
           const slot2 = document.getElementById('previewSlot');
           const hint2 = document.getElementById('previewHint');
-          if (slot2) {
-            slot2.innerHTML = `
-              <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:300px; background:var(--surface2); color:var(--text-dim); padding:32px; text-align:center; gap:12px; border-radius:8px;">
-                <div style="font-size:32px;">🔒</div>
-                <div style="font-size:14px; color:var(--text); font-weight:600;">Can't load video preview</div>
-                <div style="font-size:12px; max-width:420px; line-height:1.5;">
-                  This Drive folder isn't shared as <b style="color:var(--text);">Anyone with the link → Viewer</b>, so the dashboard can't read its contents.
-                  Open the folder in Drive, click <b style="color:var(--text);">Share</b>, and change link access to <b style="color:var(--text);">Anyone with the link</b>.
-                </div>
-                <a href="${directLink}" target="_blank" style="padding:8px 16px; border-radius:6px; background:var(--blue-bg); color:var(--blue); font-size:12px; font-weight:600; text-decoration:none; border:1px solid var(--blue);">Open folder in Drive →</a>
-              </div>`;
-          }
+          if (slot2) slot2.innerHTML = renderFolderDiagnostic(diag, folderId, directLink);
           if (hint2) hint2.innerHTML = '';
           return;
         }
@@ -3188,6 +3178,100 @@ function downloadDiagnoseCSV(items, name) {
   document.body.appendChild(a);
   a.click();
   setTimeout(() => { a.remove(); URL.revokeObjectURL(a.href); }, 500);
+}
+
+// Live diagnostic for a single folder — used by the preview modal when
+// resolveFolderToVideo returns null. Tells the user the exact reason
+// (private, empty, API restriction, etc.) instead of a generic error.
+async function diagnoseSpecificFolder(folderId) {
+  const apiKey = getDriveApiKey();
+  if (!apiKey) return { kind: 'no-api-key' };
+  try {
+    // Step 1: metadata fetch.
+    const metaRes = await fetch(`https://www.googleapis.com/drive/v3/files/${folderId}?key=${apiKey}&fields=id,name,mimeType`, { cache: 'no-store' });
+    if (metaRes.status === 404) return { kind: 'private', http: 404 };
+    if (metaRes.status === 403) {
+      let body = ''; try { body = await metaRes.text(); } catch (_) {}
+      const restricted = /referer|API key|HTTP referer/i.test(body);
+      return { kind: restricted ? 'api-key-restricted' : 'forbidden', http: 403, body };
+    }
+    if (!metaRes.ok) return { kind: 'http-error', http: metaRes.status };
+
+    // Step 2: list contents.
+    const q = encodeURIComponent("'" + folderId + "' in parents and trashed=false");
+    const listRes = await fetch(`https://www.googleapis.com/drive/v3/files?q=${q}&key=${apiKey}&fields=files(id,name,mimeType)&pageSize=20`, { cache: 'no-store' });
+    if (!listRes.ok) return { kind: 'http-error', http: listRes.status };
+    const data = await listRes.json();
+    const files = data.files || [];
+    if (!files.length) return { kind: 'empty' };
+    const videos = files.filter(f => (f.mimeType || '').startsWith('video/'));
+    if (!videos.length) return { kind: 'no-videos', files };
+    return { kind: 'ok', videos, files };
+  } catch (err) {
+    return { kind: 'network-error', message: err && err.message };
+  }
+}
+
+function renderFolderDiagnostic(diag, folderId, directLink) {
+  const box = (icon, title, body, action) => `
+    <div style="display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:300px; background:var(--surface2); color:var(--text-dim); padding:28px; text-align:center; gap:12px; border-radius:8px;">
+      <div style="font-size:30px;">${icon}</div>
+      <div style="font-size:14px; color:var(--text); font-weight:600;">${title}</div>
+      <div style="font-size:12px; max-width:480px; line-height:1.55;">${body}</div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; justify-content:center;">
+        <a href="${directLink}" target="_blank" style="padding:7px 14px; border-radius:6px; background:var(--blue-bg); color:var(--blue); font-size:11px; font-weight:600; text-decoration:none; border:1px solid var(--blue);">Open in Drive →</a>
+        ${action || ''}
+      </div>
+      <div style="font-size:10px; color:var(--text-dim); opacity:.6; margin-top:4px;">Folder ID: <code>${folderId}</code></div>
+    </div>`;
+  switch (diag.kind) {
+    case 'private':
+      return box('🔒', 'Folder isn\'t publicly accessible',
+        `The Drive API returned <b>404</b>, meaning <i>"Anyone with the link"</i> sharing isn\'t active yet. ` +
+        `If you just changed sharing, give Drive ~1-2 min to propagate, then click <b>Retry</b>. ` +
+        `Otherwise: open the folder → Share → set link access to <b>Anyone with the link → Viewer</b>.`,
+        `<button onclick="retryFolderInModal('${folderId}')" style="padding:7px 14px; border-radius:6px; background:var(--accent); color:#000; font-size:11px; font-weight:700; border:none; cursor:pointer;">↻ Retry</button>`);
+    case 'empty':
+      return box('📁', 'Folder is empty',
+        'The folder is accessible but contains no files. The Drive link in your Links sheet for this ad may point to the wrong folder.',
+        '');
+    case 'no-videos':
+      return box('🎬', 'No video files in this folder',
+        `Folder is accessible and contains <b>${diag.files.length} file(s)</b>, but none are videos. ` +
+        `Files found: ${diag.files.slice(0,3).map(f => `<code>${f.name}</code>`).join(', ')}${diag.files.length > 3 ? '…' : ''}.`,
+        '');
+    case 'api-key-restricted':
+      return box('🔑', 'Drive API key restriction',
+        'The default Drive API key is rejecting requests from this domain (HTTP referrer restriction). Generate your own API key in Google Cloud Console with no referrer restriction (or add this Railway domain to the allowed list), then paste it in Settings → Drive API.',
+        '');
+    case 'forbidden':
+      return box('🚫', 'Drive API returned 403 Forbidden',
+        `The API key call was rejected. This usually means the key is restricted or quota is exhausted. Try a different key in Settings → Drive API.`,
+        '');
+    case 'no-api-key':
+      return box('🔑', 'No Drive API key configured',
+        'Set <code>DRIVE_API_KEY</code> in Railway → Variables (or paste a key in Settings → Drive API). Without it, folder links can\'t be resolved.',
+        '');
+    case 'network-error':
+      return box('📡', 'Network error reaching Drive API',
+        `Couldn't reach googleapis.com. ${diag.message || ''} Check your connection and click Retry.`,
+        `<button onclick="retryFolderInModal('${folderId}')" style="padding:7px 14px; border-radius:6px; background:var(--accent); color:#000; font-size:11px; font-weight:700; border:none; cursor:pointer;">↻ Retry</button>`);
+    case 'http-error':
+      return box('⚠️', `Drive API returned HTTP ${diag.http}`,
+        `Unexpected response from googleapis.com. Try Retry; if it persists this is likely a Drive outage or a stricter API key issue.`,
+        `<button onclick="retryFolderInModal('${folderId}')" style="padding:7px 14px; border-radius:6px; background:var(--accent); color:#000; font-size:11px; font-weight:700; border:none; cursor:pointer;">↻ Retry</button>`);
+    default:
+      return box('🤔', 'Couldn\'t resolve preview',
+        'Unknown error. Open in Drive to view this folder directly.',
+        '');
+  }
+}
+
+// Retry button handler — clears the cache and re-opens the modal so the
+// folder is re-resolved against fresh API state.
+function retryFolderInModal(folderId) {
+  delete _folderResolveCache[folderId];
+  if (currentModalAdId != null) openModal(currentModalAdId);
 }
 
 async function resolveFolderToVideo(folderId) {
