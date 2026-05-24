@@ -1508,15 +1508,6 @@ function renderDashboard() {
   }
 
   grid.innerHTML = filtered.map(ad => {
-    const failedKeys = Object.keys(ad.failed);
-    const priorityLabel = ad.score === 5 ? '<span class="priority-label priority-high">All Clear</span>' :
-                          ad.score >= 3 ? '<span class="priority-label priority-med">Refineable</span>' :
-                          '<span class="priority-label priority-low">Rethink</span>';
-
-    const linkStatus = ad.link
-      ? '<div class="link-status link-matched">\u2713 Preview linked</div>'
-      : '<div class="link-status link-missing">No preview link</div>';
-
     const metricsHTML = Object.keys(BENCHMARKS).map(key => {
       const b = BENCHMARKS[key];
       const val = ad.metrics[key];
@@ -1524,15 +1515,6 @@ function renderDashboard() {
       const cls = isNaN(val) ? 'na' : (ad.passed[key] !== undefined ? 'pass' : 'fail');
       return `<div class="metric ${cls}"><div class="m-label">${b.label}</div><div class="m-value">${display}</div></div>`;
     }).join('');
-
-    // Simplified refinement (no verbose text — just the tag, keeps it clean)
-    let refinementHTML = '';
-    if (ad.score < 5 && ad.score >= 3) {
-      const fixes = failedKeys.map(k => BENCHMARKS[k].label).join(', ');
-      refinementHTML = `<div class="card-refinement"><div class="refinement-tag">Fix: ${fixes}</div></div>`;
-    } else if (ad.score < 3) {
-      refinementHTML = `<div class="card-refinement"><div class="refinement-tag" style="color:var(--red);">${failedKeys.length} metrics below benchmark \u2014 consider reworking</div></div>`;
-    }
 
     // Thumbnail (left side, Meta Ads Manager style)
     let fileId = ad.link ? getDriveFileId(ad.link) : null;
@@ -1560,12 +1542,9 @@ function renderDashboard() {
         ${thumbHTML}
         <div class="card-header-main">
           <div class="card-title" title="${ad.name}">${ad.name}${variantTag}</div>
-          <div style="margin-top:4px; display:flex; gap:6px; align-items:center; flex-wrap:wrap;">${priorityLabel}${linkStatus}</div>
         </div>
-        <div class="score-circle score-${ad.score}">${ad.score}/5</div>
       </div>
       <div class="card-metrics">${metricsHTML}</div>
-      ${refinementHTML}
       <div class="card-actions">${previewBtn}${downloadBtn}${aiBtn}${wfBtn}</div>
     </div>`;
   }).join('');
