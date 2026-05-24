@@ -70,10 +70,37 @@
   .badge-red { background:var(--red-bg); color:var(--red); }
 
   /* Tabs */
-  .main-tabs { display:flex; gap:0; padding:0 32px; max-width:1400px; margin:16px auto 0; border-bottom:1px solid var(--border); }
-  .main-tab { padding:10px 20px; font-size:13px; font-weight:600; color:var(--text-dim); cursor:pointer; border-bottom:2px solid transparent; transition:all .2s; background:none; border-top:none; border-left:none; border-right:none; }
-  .main-tab:hover { color:var(--text); }
-  .main-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+  /* Tab bar is hidden by default — exposed through the hamburger menu in
+     the header. Keeping the existing markup means the data-tab click
+     handlers in JS keep working unchanged. */
+  .main-tabs { display:none; }
+
+  /* Hamburger menu trigger + dropdown panel */
+  .menu-trigger { position:relative; display:inline-flex; align-items:center; }
+  .menu-trigger > button.menu-btn {
+    padding:6px 10px; border-radius:6px; border:1px solid var(--border);
+    background:var(--surface); color:var(--text); font-size:18px; line-height:1;
+    cursor:pointer; font-weight:600;
+  }
+  .menu-trigger > button.menu-btn:hover { border-color:var(--accent); color:var(--accent); }
+  .menu-dropdown {
+    display:none; position:absolute; top:calc(100% + 8px); right:0;
+    min-width:180px; background:var(--surface); border:1px solid var(--border);
+    border-radius:8px; box-shadow:0 8px 24px rgba(0,0,0,.4); padding:6px;
+    flex-direction:column; gap:2px; z-index:50;
+  }
+  /* Invisible bridge — keeps :hover alive as the mouse crosses from the
+     button into the dropdown panel. */
+  .menu-dropdown::before { content:''; position:absolute; top:-8px; left:0; right:0; height:8px; }
+  .menu-trigger:hover .menu-dropdown,
+  .menu-trigger:focus-within .menu-dropdown { display:flex; }
+  .menu-dropdown .main-tab {
+    display:block; width:100%; text-align:left; padding:9px 14px;
+    font-size:13px; font-weight:600; color:var(--text-dim); cursor:pointer;
+    background:none; border:none; border-radius:6px; transition:all .15s;
+  }
+  .menu-dropdown .main-tab:hover { color:var(--text); background:var(--surface2); }
+  .menu-dropdown .main-tab.active { color:var(--accent); background:var(--accent-bg); }
   .tab-content { display:none; }
   .tab-content.active { display:block; }
 
@@ -482,6 +509,18 @@
   <div class="header-right">
     <button id="btnRefreshData" onclick="refreshData()" title="Re-pull data from Google Sheets" style="padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;">↻ Refresh data</button>
     <span style="font-size:11px; color:#000000; font-weight:700; margin-right:8px; border:1px solid var(--accent); padding:5px 12px; border-radius:6px; background:var(--accent);">Have suggestions? Tell Anushka Rathore now!</span>
+
+    <!-- Hamburger menu — hover or click to reveal tab navigation -->
+    <div class="menu-trigger" id="navMenu">
+      <button class="menu-btn" type="button" aria-label="Open menu" aria-haspopup="true" tabindex="0">☰</button>
+      <div class="menu-dropdown" id="navMenuDropdown">
+        <button class="main-tab active" data-tab="creatives">Creatives</button>
+        <button class="main-tab" data-tab="workflow">Workflow</button>
+        <button class="main-tab" data-tab="variants">A/B Variants</button>
+        <button class="main-tab" data-tab="patterns">Performance Lab</button>
+        <button class="main-tab" data-tab="contacts">Settings</button>
+      </div>
+    </div>
   </div>
 </div>
 
@@ -501,14 +540,6 @@
 <!-- ========== DASHBOARD SECTION ========== -->
 <div id="dashboardSection" style="display:none;">
 
-  <!-- Tabs -->
-  <div class="main-tabs">
-    <button class="main-tab active" data-tab="creatives">Creatives</button>
-    <button class="main-tab" data-tab="workflow">Workflow</button>
-    <button class="main-tab" data-tab="variants">A/B Variants</button>
-    <button class="main-tab" data-tab="patterns">Performance Lab</button>
-    <button class="main-tab" data-tab="contacts">Settings</button>
-  </div>
 
   <!-- Current user bar -->
   <div class="current-user-bar" id="currentUserBar" style="display:none;">
