@@ -457,7 +457,11 @@
   /* List view — one ad per horizontal row. Shows: small play thumb, name,
      all 5 metric tiles inline. Hides: score circle, priority pill, "Preview
      linked" status, refinement tag, download/workflow buttons. */
-  body.list-view .cards-grid { grid-template-columns:1fr !important; gap:4px; padding:10px 32px 40px; }
+  body.list-view .cards-grid { grid-template-columns:1fr !important; gap:4px; padding:10px 32px 40px; max-width:1200px; margin-left:auto; margin-right:auto; }
+  /* Keep search/sort/filter rows aligned with the list column. */
+  body.list-view .top-controls,
+  body.list-view .filters,
+  body.list-view .compare-bar { max-width:1200px; margin-left:auto; margin-right:auto; }
   body.list-view .card { display:flex; flex-direction:row; align-items:center; gap:12px; padding:6px 12px; overflow:visible; cursor:pointer; }
   body.list-view .card:hover { border-color:var(--accent); }
   body.list-view .card-header { flex:1 1 auto; padding:0; min-width:0; gap:10px; }
