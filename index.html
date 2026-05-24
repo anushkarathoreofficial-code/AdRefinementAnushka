@@ -3232,11 +3232,21 @@ function downloadDiagnoseCSV(items, name) {
 }
 
 // ============ VARIATIONS PANEL ============
-// Loose name-similarity clustering (dice >= 0.45) so ads named like cuts /
-// remixes of the same concept group together regardless of where the version
-// marker sits. Sorted chronologically so V1 = earliest by Date created. A ★
-// is placed next to whichever variant currently has the best (lowest) CPI.
-const _VAR_DICE_THRESHOLD = 0.45;
+// Strict name-similarity clustering: pairs only count as variations if they
+// differ by at most ~2 tokens AND both dice + jaccard signals agree on high
+// similarity. So "Pickleball cut 2|V1|Aditya" matches "Pickleball cut 2|V2|
+// Aditya" but unrelated ads sharing one or two common tokens don't get
+// pulled in. Sorted by CPI ascending so V1 = best (lowest) CPI in the group.
+const _VAR_SIMILARITY_THRESHOLD = 0.7;   // both dice & jaccard must exceed this
+const _VAR_MAX_TOKEN_DIFF       = 3;     // distinct tokens between names
+
+function _tokenDiff(setA, setB) {
+  let onlyA = 0, onlyB = 0;
+  for (const t of setA) if (!setB.has(t)) onlyA++;
+  for (const t of setB) if (!setA.has(t)) onlyB++;
+  return onlyA + onlyB;
+}
+
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
   const seedKey     = normalizeAdName(seedAd.name);
@@ -3251,20 +3261,25 @@ function findVariations(seedAd) {
     const otherTokens  = new Set(_tokensFor(ad.name));
     const dice = _diceFromBigrams(seedBigrams, otherBigrams);
     const jacc = _jaccard(seedTokens, otherTokens);
-    // Weighted blend — bigrams handle substring overlap, jaccard handles
-    // token reorderings. Either signal can pull a pair into the group.
-    const score = Math.max(dice, jacc);
-    if (score >= _VAR_DICE_THRESHOLD) matches.push({ ad, score });
+    const diff = _tokenDiff(seedTokens, otherTokens);
+    // Strict: BOTH signals high AND few tokens differ.
+    if (dice >= _VAR_SIMILARITY_THRESHOLD &&
+        jacc >= _VAR_SIMILARITY_THRESHOLD &&
+        diff <= _VAR_MAX_TOKEN_DIFF) {
+      matches.push({ ad, score: Math.min(dice, jacc) });
+    }
   }
   if (matches.length <= 1) return [];
 
-  // Sort by Date created ascending (oldest = V1). Tie-breaker: ad.id.
+  // Sort by CPI ascending (best CPI = V1). Tie-breaker: date, then id.
   matches.sort((a, b) => {
+    const ca = a.ad.metrics.cpi, cb = b.ad.metrics.cpi;
+    const aHas = !isNaN(ca), bHas = !isNaN(cb);
+    if (aHas && bHas && ca !== cb) return ca - cb;
+    if (aHas !== bHas) return aHas ? -1 : 1;
     const da = parseAdDate(a.ad.extra && a.ad.extra.date);
     const db = parseAdDate(b.ad.extra && b.ad.extra.date);
     if (da && db) return da - db;
-    if (da) return -1;
-    if (db) return 1;
     return a.ad.id - b.ad.id;
   });
   return matches;
@@ -3276,19 +3291,10 @@ function renderVariationsPanel(seedAdId) {
   const matches = findVariations(seedAd);
   if (!matches.length) return '';
 
-  // Best CPI marker
-  let bestCpi = null;
-  for (const m of matches) {
-    const v = m.ad.metrics.cpi;
-    if (isNaN(v)) continue;
-    if (!bestCpi || v < bestCpi.cpi) bestCpi = { id: m.ad.id, cpi: v };
-  }
-
   const metricKeys = ['cpi','hold','hook','cti','cpm'];
   const rows = matches.map((m, i) => {
     const ad = m.ad;
     const isCurrent = m.isSelf;
-    const isBest    = bestCpi && bestCpi.id === ad.id;
     const versionNum = i + 1;
 
     const fileId   = ad.link ? getDriveFileId(ad.link) : null;
@@ -3310,10 +3316,9 @@ function renderVariationsPanel(seedAdId) {
     const safeName = ad.name.replace(/"/g, '&quot;');
     const clickAttr = isCurrent ? '' : `onclick="openModal(${ad.id})"`;
     const viewingTag = isCurrent ? ' <span class="viewing">(viewing)</span>' : '';
-    const starTag = isBest ? '<span class="star">★</span>' : '';
 
     return `<div class="variation-row ${isCurrent ? 'current' : ''}" ${clickAttr}>
-      <span class="v-badge">V${versionNum}${starTag}</span>
+      <span class="v-badge">V${versionNum}</span>
       ${thumbHTML}
       <div class="var-name" title="${safeName}">${ad.name}${viewingTag}</div>
       <div class="var-metrics">${metricsHTML}</div>
@@ -3324,7 +3329,7 @@ function renderVariationsPanel(seedAdId) {
     <div class="variations-panel">
       <div class="var-header">
         <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">V1 = earliest · ★ = best CPI · click to open</span>
+        <span class="var-hint">Ranked by CPI low → high · click any row to open</span>
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
