@@ -3234,83 +3234,56 @@ function downloadDiagnoseCSV(items, name) {
 }
 
 // ============ VARIATIONS PANEL ============
-// Match on the HOOK only (the opening phrase of the ad title, before the
-// first major separator like "|"). Emojis, creator-name suffixes, PPP/AAAT
-// tags, "Copy" suffixes, and version markers are stripped before comparison.
-// Two ads cluster as variants only when their hooks are very close (high
-// dice + jaccard AND only 1-2 distinct tokens between them). Sorted by CPI
-// ascending so V1 = best (lowest) CPI in the group.
-const _VAR_SIMILARITY_THRESHOLD = 0.7;
-const _VAR_MAX_TOKEN_DIFF       = 2;
-const _VAR_MIN_HOOK_TOKENS      = 2;
+// Match on the HOOK only — the opening concept of the ad title. We strip
+// emojis, then take everything before the first separator (|, [, (, dash),
+// then strip trailing V<n> / cut<n> / copy markers. Ads sharing the same
+// normalized hook cluster together as variants of the same concept,
+// regardless of which version/cut/creator they are.
+// Sorted by CPI ascending so V1 = best (lowest) CPI in the group.
 
 // Extract the hook from an ad name:
 //   1. Strip emojis & pictographs
-//   2. Take the prefix up to the first "|" / "[" / "(" / "—" separator
-//      (these conventionally split title from creator/version metadata)
-//   3. Pass through normalizeAdName to drop "Copy", unify dashes, etc.
+//   2. Take the prefix up to the first separator that conventionally splits
+//      title from creator/version metadata
+//   3. Strip trailing V<n> / cut<n> / copy markers so "Pickleball cut 2|V1"
+//      and "Pickleball cut 3|V2" both reduce to hook "pickleball"
+//   4. normalizeAdName to lowercase + clean whitespace
 function extractHook(name) {
   if (!name) return '';
   let s = String(name)
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2700}-\u{27BF}\u{1F000}-\u{1F2FF}]/gu, '')
-    .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '')   // variation selectors + ZWJ
-    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '');                // flag halves
-  // Take the prefix up to the first | / [ / ( / — (em dash) / – (en dash)
+    .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '')
+    .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '');
   const sepMatch = s.match(/[|\[\(–—]/);
   if (sepMatch && sepMatch.index >= 4) s = s.slice(0, sepMatch.index);
-  // Drop trailing version / copy markers ONLY. "cut N" is preserved because
-  // it usually denotes a distinct cut of footage, not a variation marker —
-  // "Pickleball cut 2" and "Pickleball cut 3" should NOT cluster as variants.
-  s = s.replace(/[\s_\-]*(?:v\d+|ver\d+|version\s*\d+|copy(?:\s*\d+)?)[\s_\-]*$/gi, '');
+  // Strip ANY trailing version / cut / copy markers (may repeat — e.g.
+  // "_cut1_v2" needs two passes). Loop until no more change.
+  while (true) {
+    const before = s;
+    s = s.replace(/[\s_\-]*(?:v\d+|ver\d+|version\s*\d+|cut\s*\d+|copy(?:\s*\d+)?)[\s_\-]*$/gi, '');
+    if (s === before) break;
+  }
   return normalizeAdName(s);
 }
 
-// Precompute hooks + their bigrams/tokens once per allAds change; cache by
-// ad id so repeated openModal calls don't recompute. Bumped on every data
-// load / refresh via bumpVariationCacheVersion() to avoid stale entries.
-let _variationDataVersion = 0;
-function bumpVariationCacheVersion() { _variationDataVersion++; _variationHookCache.byId.clear(); }
-let _variationHookCache = { byId: new Map() };
-function _getHookIndex(ad) {
-  let entry = _variationHookCache.byId.get(ad.id);
-  if (entry) return entry;
-  const hook = extractHook(ad.name);
-  entry = {
-    hook,
-    bigrams: _bigrams(hook),
-    tokens:  new Set(_tokensFor(hook))
-  };
-  _variationHookCache.byId.set(ad.id, entry);
-  return entry;
-}
-
-function _tokenDiff(setA, setB) {
-  let onlyA = 0, onlyB = 0;
-  for (const t of setA) if (!setB.has(t)) onlyA++;
-  for (const t of setB) if (!setA.has(t)) onlyB++;
-  return onlyA + onlyB;
+// Per-ad hook cache. Bumped on every data refresh.
+let _variationHookCache = new Map();
+function bumpVariationCacheVersion() { _variationHookCache.clear(); }
+function _getHook(ad) {
+  let h = _variationHookCache.get(ad.id);
+  if (h === undefined) { h = extractHook(ad.name); _variationHookCache.set(ad.id, h); }
+  return h;
 }
 
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
-  const seedIdx = _getHookIndex(seedAd);
-  // Hooks shorter than the minimum aren't reliable enough to cluster on —
-  // would false-match too many unrelated ads.
-  if (seedIdx.tokens.size < _VAR_MIN_HOOK_TOKENS) return [];
+  const seedHook = _getHook(seedAd);
+  if (!seedHook) return []; // empty hook = nothing to match against
 
   const matches = [];
   for (const ad of allAds) {
-    if (ad.id === seedAd.id) { matches.push({ ad, score: 1, isSelf: true }); continue; }
-    const otherIdx = _getHookIndex(ad);
-    if (otherIdx.tokens.size < _VAR_MIN_HOOK_TOKENS) continue;
-    const dice = _diceFromBigrams(seedIdx.bigrams, otherIdx.bigrams);
-    const jacc = _jaccard(seedIdx.tokens, otherIdx.tokens);
-    const diff = _tokenDiff(seedIdx.tokens, otherIdx.tokens);
-    if (dice >= _VAR_SIMILARITY_THRESHOLD &&
-        jacc >= _VAR_SIMILARITY_THRESHOLD &&
-        diff <= _VAR_MAX_TOKEN_DIFF) {
-      matches.push({ ad, score: Math.min(dice, jacc) });
-    }
+    if (ad.id === seedAd.id) { matches.push({ ad, isSelf: true }); continue; }
+    if (_getHook(ad) === seedHook) matches.push({ ad });
   }
   if (matches.length <= 1) return [];
 
@@ -3372,7 +3345,7 @@ function renderVariationsPanel(seedAdId) {
     <div class="variations-panel">
       <div class="var-header">
         <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">Grouped by opening hook · ranked by CPI low → high</span>
+        <span class="var-hint">Same hook, different V/cut · ranked by CPI low → high</span>
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
