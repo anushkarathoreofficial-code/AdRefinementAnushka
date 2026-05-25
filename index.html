@@ -5183,11 +5183,37 @@ renderAll = function() {
 async function _bootDashboard() {
   initCollaboration();
   await _loadRuntimeConfig();
-  loadFromBackend();
+  await loadFromBackend();
+  _startAutoRefresh();
 }
 document.addEventListener('DOMContentLoaded', _bootDashboard);
 // Also call immediately in case DOM is already ready
 if (document.readyState !== 'loading') _bootDashboard();
+
+// ============ AUTO-REFRESH ============
+// The Apps Script proxy reads the live production sheet on every request,
+// so we just need to re-fetch periodically to keep the dashboard current.
+// Default cadence: every hour while the tab is visible. Also forces an
+// immediate refresh when the user returns to the tab after being away
+// for more than an hour.
+const AUTO_REFRESH_INTERVAL_MS = 60 * 60 * 1000;
+let _autoRefreshTimer = null;
+let _lastAutoRefreshAt = Date.now();
+function _startAutoRefresh() {
+  if (_autoRefreshTimer) clearInterval(_autoRefreshTimer);
+  _autoRefreshTimer = setInterval(() => {
+    if (document.visibilityState !== 'visible') return;
+    _lastAutoRefreshAt = Date.now();
+    refreshData();
+  }, AUTO_REFRESH_INTERVAL_MS);
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible') return;
+  if (Date.now() - _lastAutoRefreshAt > AUTO_REFRESH_INTERVAL_MS) {
+    _lastAutoRefreshAt = Date.now();
+    refreshData();
+  }
+});
 </script>
 </body>
 </html>
