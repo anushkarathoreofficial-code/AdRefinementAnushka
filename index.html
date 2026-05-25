@@ -651,6 +651,7 @@
     <div class="compare-bar" id="compareBar">
       <span class="cnt"><span id="compareCnt">0</span> ads selected</span>
       <div style="display:flex; gap:6px; flex-wrap:wrap;">
+        <button class="btn" style="background:var(--accent-bg); color:var(--accent); border:1px solid var(--accent);" onclick="groupSelectedAsVariations()" title="Mark these ads as variations of each other — they'll appear in each other's Variations panel">✦ Group as Variations</button>
         <button class="btn btn-ai" onclick="exportAIComparison()">🤖 AI Comparison Report</button>
         <button class="btn btn-preview" onclick="exportSelectedCSV()">Export Selected CSV</button>
         <button class="btn" style="background:var(--surface2); color:var(--text-dim);" onclick="clearSelection()">Clear</button>
@@ -3304,8 +3305,93 @@ function _getHook(ad) {
   return h;
 }
 
+// ----- Manual variation groups (user-curated overrides) -----
+// Stored in localStorage keyed by normalized ad name so they survive page
+// refresh AND CSV reloads (ad.id changes on every CSV reload, but normalized
+// names are stable). Shape: Array<string[]>, each inner array is one group.
+function _loadManualGroups() {
+  try { return JSON.parse(localStorage.getItem('manualVariationGroups') || '[]'); }
+  catch (_) { return []; }
+}
+function _saveManualGroups(groups) {
+  try { localStorage.setItem('manualVariationGroups', JSON.stringify(groups)); } catch (_) {}
+}
+function _normForGroup(name) { return normalizeAdName(name); }
+
+// Return the manual group (array of normalized names) containing this ad,
+// or null if the ad isn't in any manual group.
+function _findManualGroupFor(adName) {
+  const key = _normForGroup(adName);
+  const groups = _loadManualGroups();
+  for (const g of groups) if (g.includes(key)) return g;
+  return null;
+}
+
+// Create/merge a manual group from the currently-selected ads. If any of
+// the selected ads is already in a manual group, the new group merges with
+// it (so the user can incrementally add ads to an existing cluster).
+function groupSelectedAsVariations() {
+  if (selectedAdIds.size < 2) {
+    alert('Pick at least 2 ads to group.');
+    return;
+  }
+  const selectedAds = allAds.filter(a => selectedAdIds.has(a.id));
+  const newKeys = selectedAds.map(a => _normForGroup(a.name)).filter(Boolean);
+  const merged = new Set(newKeys);
+
+  // Pull in members of any pre-existing group that overlaps with the new set
+  let groups = _loadManualGroups();
+  groups = groups.filter(g => {
+    if (g.some(k => merged.has(k))) { g.forEach(k => merged.add(k)); return false; }
+    return true;
+  });
+  groups.push([...merged]);
+  _saveManualGroups(groups);
+  bumpVariationCacheVersion();          // (no-op for hook cache; documents intent)
+
+  // Toast
+  const t = document.createElement('div');
+  t.style.cssText = 'position:fixed; bottom:24px; left:50%; transform:translateX(-50%); background:var(--accent); color:#000; padding:10px 18px; border-radius:8px; font-size:13px; font-weight:600; box-shadow:0 4px 16px rgba(0,0,0,.3); z-index:9999;';
+  t.textContent = `✓ Grouped ${merged.size} ads as variations`;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2500);
+
+  clearSelection();
+}
+
+// Remove the given ad from any manual group it belongs to. If the group
+// would shrink below 2 members, delete the group entirely.
+function ungroupVariation(adName) {
+  const key = _normForGroup(adName);
+  let groups = _loadManualGroups();
+  groups = groups.map(g => g.filter(k => k !== key)).filter(g => g.length >= 2);
+  _saveManualGroups(groups);
+  if (typeof currentModalAdId === 'number') {
+    const c = document.getElementById('modalVariations');
+    if (c) c.innerHTML = renderVariationsPanel(currentModalAdId);
+  }
+}
+
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
+
+  // 1. Manual override: if the seed ad is in a user-curated group, return
+  //    every ad whose normalized name appears in that same group.
+  const manualGroup = _findManualGroupFor(seedAd.name);
+  if (manualGroup) {
+    const keySet = new Set(manualGroup);
+    const matches = [];
+    for (const ad of allAds) {
+      if (keySet.has(_normForGroup(ad.name))) {
+        matches.push({ ad, isSelf: ad.id === seedAd.id, isManual: true });
+      }
+    }
+    if (matches.length > 1) return matches;
+    // If fewer than 2 of the group's ads are in the current dataset, fall
+    // through to auto-clustering below.
+  }
+
+  // 2. Auto-clustering: exact hook match (V/cut markers stripped).
   const seedHook = _getHook(seedAd);
   if (!seedHook) return [];
 
@@ -3370,11 +3456,18 @@ function renderVariationsPanel(seedAdId) {
     </div>`;
   }).join('');
 
+  const isManual = matches.some(m => m.isManual);
+  const safeSeedName = seedAd.name.replace(/'/g, "\\'").replace(/"/g, '&quot;');
+  const hint = isManual
+    ? `<span class="var-hint">Manual group · ranked by CPI low → high · <a href="#" onclick="event.preventDefault(); ungroupVariation('${safeSeedName}')" style="color:var(--blue);">Ungroup this ad</a></span>`
+    : `<span class="var-hint">Differing only by V/cut · ranked by CPI low → high</span>`;
+  const titleBadge = isManual ? ' <span style="font-size:9px; color:var(--accent); background:var(--accent-bg); padding:1px 5px; border-radius:3px; margin-left:4px; vertical-align:middle;">manual</span>' : '';
+
   return `
     <div class="variations-panel">
       <div class="var-header">
-        <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">Differing only by V/cut · ranked by CPI low → high</span>
+        <span class="var-title">Variations<span class="var-count">${matches.length}</span>${titleBadge}</span>
+        ${hint}
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
