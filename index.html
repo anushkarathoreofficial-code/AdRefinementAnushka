@@ -3234,20 +3234,19 @@ function downloadDiagnoseCSV(items, name) {
 }
 
 // ============ VARIATIONS PANEL ============
-// Match on the HOOK only — the opening concept of the ad title. We strip
-// emojis, then take everything before the first separator (|, [, (, dash),
-// then strip trailing V<n> / cut<n> / copy markers. Ads sharing the same
-// normalized hook cluster together as variants of the same concept,
-// regardless of which version/cut/creator they are.
+// Cluster ads by their HOOK ANCHOR — the first significant word of the ad
+// title after stripping emojis, creator/version metadata, and version-marker
+// suffixes. So "friend", "friend part 2", "friend dont belive cut 1", and
+// "friend | hey cut 2" all anchor on "friend" and cluster as the same group.
 // Sorted by CPI ascending so V1 = best (lowest) CPI in the group.
 
-// Extract the hook from an ad name:
-//   1. Strip emojis & pictographs
-//   2. Take the prefix up to the first separator that conventionally splits
-//      title from creator/version metadata
-//   3. Strip trailing V<n> / cut<n> / copy markers so "Pickleball cut 2|V1"
-//      and "Pickleball cut 3|V2" both reduce to hook "pickleball"
-//   4. normalizeAdName to lowercase + clean whitespace
+const _VAR_MIN_WORD_LEN = 4;            // first word must be ≥ this many chars
+
+// Strip ad name down to the concept portion:
+//   1. Remove emojis, pictographs, variation selectors, flag halves
+//   2. Take the prefix up to the first conventional separator (| [ ( em/en dash)
+//   3. Strip trailing V<n> / cut<n> / version / copy markers (looped)
+//   4. Lowercase + clean whitespace via normalizeAdName
 function extractHook(name) {
   if (!name) return '';
   let s = String(name)
@@ -3256,8 +3255,6 @@ function extractHook(name) {
     .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '');
   const sepMatch = s.match(/[|\[\(–—]/);
   if (sepMatch && sepMatch.index >= 4) s = s.slice(0, sepMatch.index);
-  // Strip ANY trailing version / cut / copy markers (may repeat — e.g.
-  // "_cut1_v2" needs two passes). Loop until no more change.
   while (true) {
     const before = s;
     s = s.replace(/[\s_\-]*(?:v\d+|ver\d+|version\s*\d+|cut\s*\d+|copy(?:\s*\d+)?)[\s_\-]*$/gi, '');
@@ -3266,24 +3263,34 @@ function extractHook(name) {
   return normalizeAdName(s);
 }
 
-// Per-ad hook cache. Bumped on every data refresh.
-let _variationHookCache = new Map();
-function bumpVariationCacheVersion() { _variationHookCache.clear(); }
-function _getHook(ad) {
-  let h = _variationHookCache.get(ad.id);
-  if (h === undefined) { h = extractHook(ad.name); _variationHookCache.set(ad.id, h); }
-  return h;
+// The first significant word inside the hook — used as the cluster key.
+// Strips leading short words ("I", "you", "the", "a", numeric tokens) so
+// "I invite you to free psychic" anchors on "invite", not "i".
+function extractHookAnchor(name) {
+  const hook = extractHook(name);
+  if (!hook) return '';
+  const words = hook.split(/\s+/).filter(w => /[a-z]/i.test(w) && w.length >= _VAR_MIN_WORD_LEN);
+  return words[0] || '';
+}
+
+// Per-ad anchor cache. Cleared on every data refresh.
+let _variationAnchorCache = new Map();
+function bumpVariationCacheVersion() { _variationAnchorCache.clear(); }
+function _getAnchor(ad) {
+  let a = _variationAnchorCache.get(ad.id);
+  if (a === undefined) { a = extractHookAnchor(ad.name); _variationAnchorCache.set(ad.id, a); }
+  return a;
 }
 
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
-  const seedHook = _getHook(seedAd);
-  if (!seedHook) return []; // empty hook = nothing to match against
+  const seedAnchor = _getAnchor(seedAd);
+  if (!seedAnchor) return [];
 
   const matches = [];
   for (const ad of allAds) {
     if (ad.id === seedAd.id) { matches.push({ ad, isSelf: true }); continue; }
-    if (_getHook(ad) === seedHook) matches.push({ ad });
+    if (_getAnchor(ad) === seedAnchor) matches.push({ ad });
   }
   if (matches.length <= 1) return [];
 
@@ -3345,7 +3352,7 @@ function renderVariationsPanel(seedAdId) {
     <div class="variations-panel">
       <div class="var-header">
         <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">Same hook, different V/cut · ranked by CPI low → high</span>
+        <span class="var-hint">Same opening word · ranked by CPI low → high</span>
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
