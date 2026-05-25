@@ -3234,63 +3234,55 @@ function downloadDiagnoseCSV(items, name) {
 }
 
 // ============ VARIATIONS PANEL ============
-// Cluster ads by their HOOK ANCHOR — the first significant word of the ad
-// title after stripping emojis, creator/version metadata, and version-marker
-// suffixes. So "friend", "friend part 2", "friend dont belive cut 1", and
-// "friend | hey cut 2" all anchor on "friend" and cluster as the same group.
-// Sorted by CPI ascending so V1 = best (lowest) CPI in the group.
+// Cluster two ads as variants only if, after stripping ALL V<n>, cut<n>,
+// version<n>, and copy markers (anywhere in the string), the remaining hook
+// is byte-for-byte identical. So:
+//   - "Street interview beach V1"  ↔ "Street interview beach V2"      ✓
+//   - "Pickleball cut 2|V1"        ↔ "Pickleball cut 3|V2"            ✓
+//   - "Street interview beach"     ↔ "Street interview coachella"     ✗
+// Sorted by CPI ascending so V1 in the panel = best (lowest) CPI.
 
-const _VAR_MIN_WORD_LEN = 4;            // first word must be ≥ this many chars
-
-// Strip ad name down to the concept portion:
-//   1. Remove emojis, pictographs, variation selectors, flag halves
-//   2. Take the prefix up to the first conventional separator (| [ ( em/en dash)
-//   3. Strip trailing V<n> / cut<n> / version / copy markers (looped)
-//   4. Lowercase + clean whitespace via normalizeAdName
 function extractHook(name) {
   if (!name) return '';
+  // 1. Strip emojis & related codepoints.
   let s = String(name)
     .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2700}-\u{27BF}\u{1F000}-\u{1F2FF}]/gu, '')
     .replace(/[\u{FE00}-\u{FE0F}\u{200D}\u{20E3}]/gu, '')
     .replace(/[\u{1F1E6}-\u{1F1FF}]/gu, '');
+  // 2. Truncate at the first conventional separator (creator/tag metadata
+  //    lives after | [ ( em-dash / en-dash).
   const sepMatch = s.match(/[|\[\(–—]/);
   if (sepMatch && sepMatch.index >= 4) s = s.slice(0, sepMatch.index);
+  // 3. Strip V<n> / cut<n> / version<n> / copy markers ANYWHERE in the
+  //    remaining string. Uses a non-alphanumeric boundary instead of \b
+  //    because JS \b treats "_" as a word char, which would miss "_V1"
+  //    and "_cut1". Looped so chained markers like "_cut1_v2_" clear.
   while (true) {
     const before = s;
-    s = s.replace(/[\s_\-]*(?:v\d+|ver\d+|version\s*\d+|cut\s*\d+|copy(?:\s*\d+)?)[\s_\-]*$/gi, '');
+    s = s.replace(/(^|[^a-zA-Z0-9])(?:v\s*\d+|ver\s*\d+|version\s*\d+|cut\s*\d+|copy(?:\s*\d+)?)(?=[^a-zA-Z0-9]|$)/gi, '$1 ');
     if (s === before) break;
   }
   return normalizeAdName(s);
 }
 
-// The first significant word inside the hook — used as the cluster key.
-// Strips leading short words ("I", "you", "the", "a", numeric tokens) so
-// "I invite you to free psychic" anchors on "invite", not "i".
-function extractHookAnchor(name) {
-  const hook = extractHook(name);
-  if (!hook) return '';
-  const words = hook.split(/\s+/).filter(w => /[a-z]/i.test(w) && w.length >= _VAR_MIN_WORD_LEN);
-  return words[0] || '';
-}
-
-// Per-ad anchor cache. Cleared on every data refresh.
-let _variationAnchorCache = new Map();
-function bumpVariationCacheVersion() { _variationAnchorCache.clear(); }
-function _getAnchor(ad) {
-  let a = _variationAnchorCache.get(ad.id);
-  if (a === undefined) { a = extractHookAnchor(ad.name); _variationAnchorCache.set(ad.id, a); }
-  return a;
+// Per-ad hook cache. Cleared on every data refresh.
+let _variationHookCache = new Map();
+function bumpVariationCacheVersion() { _variationHookCache.clear(); }
+function _getHook(ad) {
+  let h = _variationHookCache.get(ad.id);
+  if (h === undefined) { h = extractHook(ad.name); _variationHookCache.set(ad.id, h); }
+  return h;
 }
 
 function findVariations(seedAd) {
   if (!seedAd || !allAds.length) return [];
-  const seedAnchor = _getAnchor(seedAd);
-  if (!seedAnchor) return [];
+  const seedHook = _getHook(seedAd);
+  if (!seedHook) return [];
 
   const matches = [];
   for (const ad of allAds) {
     if (ad.id === seedAd.id) { matches.push({ ad, isSelf: true }); continue; }
-    if (_getAnchor(ad) === seedAnchor) matches.push({ ad });
+    if (_getHook(ad) === seedHook) matches.push({ ad });
   }
   if (matches.length <= 1) return [];
 
@@ -3352,7 +3344,7 @@ function renderVariationsPanel(seedAdId) {
     <div class="variations-panel">
       <div class="var-header">
         <span class="var-title">Variations<span class="var-count">${matches.length}</span></span>
-        <span class="var-hint">Same opening word · ranked by CPI low → high</span>
+        <span class="var-hint">Differing only by V/cut · ranked by CPI low → high</span>
       </div>
       <div class="variations-list">${rows}</div>
     </div>`;
