@@ -1259,9 +1259,13 @@ function parseMetaCSV(text) {
   headers.forEach((h, i) => {
     const hl = h.replace(/[^a-z0-9 ]/g, '').trim();
     if (hl.includes('ad name') || hl === 'name' || hl === 'ad' || hl.includes('creative name')) colMap.name = i;
-    if (hl.includes('cpi') || hl.includes('cost per install') || hl.includes('cost per result')) colMap.cpi = i;
+    // Prefer explicit CPI / cost-per-install. "Cost per results" is handled
+    // as a fallback below so it doesn't override an explicit CPI column.
+    if (hl === 'cpi' || hl.includes('cost per install')) colMap.cpi = i;
     if (hl.includes('hold') || hl.includes('hold rate') || hl.includes('thruplay')) colMap.hold = i;
     if (hl.includes('hook') || hl.includes('hook rate') || hl.includes('3 second') || hl.includes('3s')) colMap.hook = i;
+    // Prefer explicit CTI / click-to-install. Fallback to "Cost per results"
+    // when no CTI column exists in the CSV (handled below).
     if (hl.includes('cti') || hl.includes('click to install') || hl.includes('clicktoinstall')) colMap.cti = i;
     if (hl === 'cpm' || hl.includes('cost per 1000') || hl.includes('cost per mille')) colMap.cpm = i;
     if (hl.includes('drive') || hl.includes('creative link') || hl.includes('video url') || hl.includes('video link')) colMap.link = i;
@@ -1275,6 +1279,32 @@ function parseMetaCSV(text) {
     if (hl.includes('date') || hl.includes('published') || hl.includes('started') || hl.includes('launch')) colMap.date = i;
     if (hl.includes('install') && !hl.includes('cost') && !hl.includes('click')) colMap.installs = i;
   });
+
+  // Fallback: if either CPI or CTI didn't match an explicit column, map them
+  // to the "Cost per results" column. This handles:
+  //   - Old CSV format (no explicit CPI, but has "Cost per results") → CPI fallback
+  //   - New CSV format (has explicit CPI, no CTI column)             → CTI fallback
+  if (colMap.cpi == null || colMap.cti == null) {
+    headers.forEach((h, i) => {
+      const hl = h.replace(/[^a-z0-9 ]/g, '').trim();
+      if (hl.includes('cost per result')) {
+        if (colMap.cpi == null) colMap.cpi = i;
+        if (colMap.cti == null) colMap.cti = i;
+      }
+    });
+  }
+
+  // When CTI ends up mapped to a cost-based column, change its benchmark
+  // unit (₹ instead of %), direction (lower-is-better), label, and target so
+  // the dashboard renders / scores it correctly. Otherwise reset to default.
+  if (colMap.cti != null) {
+    const ctiHeader = (headers[colMap.cti] || '').toLowerCase();
+    if (ctiHeader.includes('cost')) {
+      BENCHMARKS.cti = { label: 'Cost/Result', target: 350, direction: 'lower', unit: '₹' };
+    } else {
+      BENCHMARKS.cti = JSON.parse(JSON.stringify(DEFAULT_BENCHMARKS.cti));
+    }
+  }
 
   // First pass: collect raw values to detect decimal format
   const rawRows = [];
