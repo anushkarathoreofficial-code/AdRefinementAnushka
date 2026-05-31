@@ -970,7 +970,10 @@
 // Then click the "↻ Refresh data" button in the dashboard header.
 const BACKEND = {
   metaCsvUrl:  '',
-  linksCsvUrl: ''
+  linksCsvUrl: '',
+  // When the server has META_TOKEN + META_AD_ACCOUNT set, this points at the
+  // Node proxy (/api/meta-insights.csv) and takes priority over metaCsvUrl.
+  metaApiUrl:  ''
 };
 
 async function _loadRuntimeConfig() {
@@ -980,6 +983,7 @@ async function _loadRuntimeConfig() {
     const cfg = await res.json();
     BACKEND.metaCsvUrl  = cfg.metaCsvUrl  || '';
     BACKEND.linksCsvUrl = cfg.linksCsvUrl || '';
+    BACKEND.metaApiUrl  = cfg.metaApiUrl  || '';
     if (cfg.driveApiKey) _runtimeDriveApiKey = cfg.driveApiKey;
   } catch (e) {
     console.warn('Could not load /config.json — falling back to empty config:', e);
@@ -1478,7 +1482,9 @@ function setLoadingState(state, message) {
   if (state === 'loading') {
     icon.textContent = '⏳';
     title.textContent = 'Loading dashboard data…';
-    status.textContent = message || 'Fetching ads and creative links from Google Sheets.';
+    status.textContent = message || (BACKEND.metaApiUrl
+      ? 'Fetching ads from the Meta API and creative links from Google Sheets.'
+      : 'Fetching ads and creative links from Google Sheets.');
     actions.style.display = 'none';
   } else if (state === 'error') {
     icon.textContent = '⚠️';
@@ -1489,22 +1495,25 @@ function setLoadingState(state, message) {
 }
 
 function isConfigured() {
-  return BACKEND.metaCsvUrl && !BACKEND.metaCsvUrl.startsWith('PASTE_')
+  const hasMeta = (BACKEND.metaApiUrl)
+               || (BACKEND.metaCsvUrl && !BACKEND.metaCsvUrl.startsWith('PASTE_'));
+  return hasMeta
       && BACKEND.linksCsvUrl && !BACKEND.linksCsvUrl.startsWith('PASTE_');
 }
 
 async function loadFromBackend() {
   if (!isConfigured()) {
     setLoadingState('error',
-      'Backend is not configured yet. Open <code>index.html</code> and paste your published Google Sheet CSV URLs into the <code>BACKEND</code> object near the top of the &lt;script&gt; block.');
+      'Backend is not configured yet. Set META_TOKEN + META_AD_ACCOUNT (for the Meta API) or META_CSV_URL (for the Sheets fallback), plus LINKS_CSV_URL.');
     return;
   }
   setLoadingState('loading');
   try {
     // Cache-busting param so a freshly republished sheet shows up immediately.
-    const bust = '&_=' + Date.now();
     const sep = (url) => url.includes('?') ? '&' : '?';
-    const metaUrl  = BACKEND.metaCsvUrl  + sep(BACKEND.metaCsvUrl)  + 'cb=' + Date.now();
+    // Prefer the live Meta API endpoint when configured; fall back to CSV.
+    const metaSrc  = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
+    const metaUrl  = metaSrc + sep(metaSrc) + 'cb=' + Date.now();
     const linksUrl = BACKEND.linksCsvUrl + sep(BACKEND.linksCsvUrl) + 'cb=' + Date.now();
 
     const [metaRes, linksRes] = await Promise.all([
