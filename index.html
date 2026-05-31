@@ -1127,6 +1127,7 @@ async function _loadRuntimeConfig() {
     BACKEND.metaApiUrl        = cfg.metaApiUrl  || '';
     BACKEND.driveProxyEnabled = !!cfg.driveProxyEnabled;
     if (cfg.driveApiKey) _runtimeDriveApiKey = cfg.driveApiKey;
+    if (cfg.geminiApiKey) _runtimeGeminiKey = cfg.geminiApiKey;
   } catch (e) {
     console.warn('Could not load /config.json — falling back to empty config:', e);
   }
@@ -3375,6 +3376,34 @@ function saveAIKey() {
   renderDashboard();
 }
 
+// When GEMINI_API_KEY is set on the server (delivered via /config.json),
+// auto-connect Gemini so the AI features just work for every signed-in
+// dashboard user without anyone touching the Settings tab.
+function _autoConnectGeminiFromConfig() {
+  if (!_runtimeGeminiKey) return;
+  if (aiApiKey) return; // user already pasted their own — don't overwrite
+  aiApiKey = _runtimeGeminiKey;
+  aiProvider = 'gemini';
+  const providerSelect = document.getElementById('aiProvider');
+  if (providerSelect) {
+    providerSelect.value = 'gemini';
+    // Re-run onProviderChange to refresh placeholder + model list, then
+    // restore the key (onProviderChange wipes aiApiKey by design).
+    if (typeof onProviderChange === 'function') onProviderChange();
+    aiApiKey = _runtimeGeminiKey;
+  }
+  const statusEl = document.getElementById('aiStatus');
+  if (statusEl) {
+    statusEl.textContent = 'Google Gemini Connected (server)';
+    statusEl.classList.add('connected');
+  }
+  const keyInput = document.getElementById('aiKeyInput');
+  if (keyInput) {
+    keyInput.placeholder = 'Using server-side GEMINI_API_KEY (override by pasting your own)';
+    keyInput.type = 'password';
+  }
+}
+
 function saveDriveKey() {
   const key = document.getElementById('driveKeyInput').value.trim();
   if (!key) return;
@@ -3419,6 +3448,10 @@ const _folderResolveCache = {};
 // Populated by _loadRuntimeConfig() from /config.json (DRIVE_API_KEY env var).
 // User-pasted key in Settings still takes precedence via the Store.
 let _runtimeDriveApiKey = '';
+// Populated by _loadRuntimeConfig() from /config.json (GEMINI_API_KEY env var).
+// When present, the dashboard auto-connects Gemini on boot so users don't
+// have to paste a key in Settings.
+let _runtimeGeminiKey = '';
 function getDriveApiKey() {
   return Store.get('drive_api_key') || _runtimeDriveApiKey || '';
 }
@@ -5549,6 +5582,7 @@ async function _bootDashboard() {
   initCollaboration();
   await _loadRuntimeConfig();
   updateDataSourceBadge();
+  _autoConnectGeminiFromConfig();
   await loadFromBackend();
   _startAutoRefresh();
 }

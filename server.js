@@ -17,6 +17,10 @@
  *   META_AD_ACCOUNT          — Meta ad account, e.g. "act_123456789"
  *   META_DATE_PRESET         — optional, defaults to "last_7d"
  *   META_CAMPAIGN_IDS        — optional, comma-separated campaign ids to limit to
+ *   GEMINI_API_KEY           — optional. When set, every signed-in dashboard
+ *                              user gets the Gemini AI analysis features
+ *                              wired up automatically without pasting their
+ *                              own key. Exposed via /config.json (auth-gated).
  *
  * Security model:
  *   - The Meta token never leaves the server. The browser only sees the
@@ -205,7 +209,11 @@ app.get('/config.json', (req, res) => {
     // through the server (service-account-backed) instead of hitting the
     // public Drive endpoints. Required for files behind a "sign-in
     // required" sharing policy.
-    driveProxyEnabled: !!process.env.GOOGLE_CREDENTIALS_JSON
+    driveProxyEnabled: !!process.env.GOOGLE_CREDENTIALS_JSON,
+    // When set, the dashboard auto-fills the Gemini AI key on every
+    // load so users don't have to paste it individually. Only sent
+    // over the authed /config.json — never reachable anonymously.
+    geminiApiKey:      process.env.GEMINI_API_KEY || ''
   });
 });
 
