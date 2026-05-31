@@ -224,6 +224,60 @@ app.get('/api/ad-metrics', async (req, res) => {
   }
 });
 
+// ---------------- Meta API: ad creative (video URL + thumbnail) ----------------
+// Resolves an ad_id → { video_url, thumbnail_url, image_url }. Two Graph
+// calls per ad (ad → creative.video_id → video.source), cached in memory
+// because Meta's signed video URLs only live ~1h.
+const creativeCache = new Map();
+const CREATIVE_TTL_MS = 50 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of creativeCache) if (v.expiresAt <= now) creativeCache.delete(k);
+}, 10 * 60 * 1000).unref();
+
+app.get('/api/ad-creative', async (req, res) => {
+  const token = process.env.META_TOKEN;
+  if (!token) return res.status(503).json({ error: 'META_TOKEN not set' });
+
+  const adId = String(req.query.ad_id || '').trim();
+  if (!/^\d{1,30}$/.test(adId)) return res.status(400).json({ error: 'invalid ad_id' });
+
+  res.set('Cache-Control', 'no-store');
+  const cached = creativeCache.get(adId);
+  if (cached && cached.expiresAt > Date.now()) return res.json(cached.data);
+
+  try {
+    const adUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(adId)}` +
+                  `?fields=creative{video_id,thumbnail_url,image_url}` +
+                  `&access_token=${encodeURIComponent(token)}`;
+    const adRes = await fetch(adUrl);
+    const adData = await adRes.json();
+    if (!adRes.ok || adData.error) {
+      const msg = adData.error ? `${adData.error.message} (code ${adData.error.code})` : `HTTP ${adRes.status}`;
+      return res.status(502).json({ error: 'Meta API error: ' + msg });
+    }
+    const creative = adData.creative || {};
+    let videoUrl = '';
+    if (creative.video_id) {
+      const vidUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(creative.video_id)}` +
+                     `?fields=source&access_token=${encodeURIComponent(token)}`;
+      const vidRes = await fetch(vidUrl);
+      const vidData = await vidRes.json();
+      if (vidRes.ok && !vidData.error && vidData.source) videoUrl = vidData.source;
+    }
+    const data = {
+      video_url: videoUrl,
+      thumbnail_url: creative.thumbnail_url || '',
+      image_url: creative.image_url || ''
+    };
+    creativeCache.set(adId, { data, expiresAt: Date.now() + CREATIVE_TTL_MS });
+    res.json(data);
+  } catch (err) {
+    res.status(502).json({ error: 'Meta API fetch failed.' });
+  }
+});
+
 // ---------------- Meta API: full ad-level insights as CSV ----------------
 app.get('/api/meta-insights.csv', async (req, res) => {
   const token = process.env.META_TOKEN;
@@ -300,7 +354,7 @@ function sanitizeDatePreset(raw) {
 
 function buildInsightsCSV(rows) {
   const header = [
-    'Ad Name','Campaign','Campaign ID','Ad Set','Date',
+    'Ad ID','Ad Name','Campaign','Campaign ID','Ad Set','Date',
     'Spend','Impressions','Reach','Frequency',
     'Clicks','CTR','CPM','CPC',
     'Installs','CPI','Hook Rate','Hold Rate','CTI'
@@ -335,6 +389,7 @@ function buildInsightsCSV(rows) {
       ? ((installs / clicks) * 100).toFixed(2) : '';
 
     lines.push([
+      csvField(row.ad_id || ''),
       csvField(row.ad_name || ''),
       csvField(row.campaign_name || ''),
       csvField(row.campaign_id || ''),

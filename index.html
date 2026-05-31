@@ -999,6 +999,47 @@ const BACKEND = {
   metaApiUrl:  ''
 };
 
+// Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). Keeps
+// the dashboard from hitting /api/ad-creative again on every auto-refresh —
+// the server already caches for ~50min, so a session-long cache is safe.
+const _metaCreativeCache = new Map();
+let _metaCreativeFetchInflight = false;
+
+// Lazily resolve Meta video URLs + thumbnails for ads that don't already
+// have a Drive link. Re-renders affected cards as each one comes back.
+async function enrichAdsWithMetaCreatives() {
+  if (_metaCreativeFetchInflight) return;
+  if (!BACKEND.metaApiUrl) return; // only meaningful when Meta API is the source
+  const targets = allAds.filter(a => a.adId && !a.link && !a.metaVideo && !a.metaThumb);
+  if (!targets.length) return;
+  _metaCreativeFetchInflight = true;
+  try {
+    // Run with bounded concurrency so we don't fan out 200 requests at once.
+    const queue = [...targets];
+    const workers = Array.from({ length: 4 }, async () => {
+      while (queue.length) {
+        const ad = queue.shift();
+        try {
+          const r = await fetch('/api/ad-creative?ad_id=' + encodeURIComponent(ad.adId),
+                                { credentials: 'same-origin', cache: 'no-store' });
+          if (!r.ok) continue;
+          const data = await r.json();
+          _metaCreativeCache.set(ad.adId, data);
+          ad.metaVideo = data.video_url || '';
+          ad.metaThumb = data.thumbnail_url || data.image_url || '';
+        } catch (e) {
+          // Silent: a single ad failing to resolve shouldn't block the rest.
+        }
+      }
+    });
+    await Promise.all(workers);
+    // One bulk re-render at the end is cheaper than rerendering per card.
+    if (typeof renderAll === 'function') renderAll();
+  } finally {
+    _metaCreativeFetchInflight = false;
+  }
+}
+
 async function _loadRuntimeConfig() {
   try {
     const res = await fetch('/config.json', { cache: 'no-store' });
@@ -1286,6 +1327,7 @@ function parseMetaCSV(text) {
   const colMap = {};
   headers.forEach((h, i) => {
     const hl = h.replace(/[^a-z0-9 ]/g, '').trim();
+    if (hl === 'ad id' || hl === 'adid' || hl === 'ad_id') colMap.adId = i;
     if (hl.includes('ad name') || hl === 'name' || hl === 'ad' || hl.includes('creative name')) colMap.name = i;
     // Prefer explicit CPI / cost-per-install. "Cost per results" is handled
     // as a fallback below so it doesn't override an explicit CPI column.
@@ -1417,7 +1459,20 @@ function parseMetaCSV(text) {
       else { failed[key] = val; }
     });
 
-    ads.push({ name, metrics, passed, failed, score, link, impressions, spend, extra, id: idx + 1, linkMatch });
+    // adId comes straight from Meta when /api/meta-insights.csv is the source.
+    // We use it to lazily fetch creative previews (video URL + thumbnail) via
+    // /api/ad-creative, which lets the dashboard render previews without
+    // relying on the Google Drive links sheet.
+    const adIdRaw = colMap.adId != null ? String(cols[colMap.adId] || '').trim() : '';
+    const adId = /^\d+$/.test(adIdRaw) ? adIdRaw : '';
+
+    // If we previously fetched the Meta creative for this ad, restore from
+    // the session cache so a CSV refresh doesn't force another network hop.
+    const cachedCreative = adId ? _metaCreativeCache.get(adId) : null;
+    const metaVideo = cachedCreative ? cachedCreative.video_url : '';
+    const metaThumb = cachedCreative ? (cachedCreative.thumbnail_url || cachedCreative.image_url) : '';
+
+    ads.push({ name, metrics, passed, failed, score, link, impressions, spend, extra, id: idx + 1, linkMatch, adId, metaVideo, metaThumb });
   });
 
   return ads;
@@ -1595,6 +1650,10 @@ async function loadFromBackend() {
 
     launchDashboard();
     updateDataSourceBadge();
+    // Kick off Meta creative resolution in the background — the dashboard
+    // already showed everything it could from the CSV; previews fill in
+    // as the /api/ad-creative calls land.
+    enrichAdsWithMetaCreatives();
   } catch (err) {
     setLoadingState('error', (err && err.message) || 'Unknown error fetching data.');
   }
@@ -1713,13 +1772,16 @@ function renderDashboard() {
     let fileId = ad.link ? getDriveFileId(ad.link) : null;
     const folderId = (!fileId && ad.link) ? getDriveFolderId(ad.link) : null;
     if (!fileId && folderId && _folderResolveCache[folderId]) fileId = _folderResolveCache[folderId];
+    const hasMetaPreview = !!(ad.metaVideo || ad.metaThumb);
     const thumbHTML = fileId
       ? `<img class="card-thumb" src="https://drive.google.com/thumbnail?id=${fileId}&sz=w200" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
       : folderId
         ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
-        : `<div class="card-thumb-placeholder" ${ad.link ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
+        : ad.metaThumb
+          ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
+          : `<div class="card-thumb-placeholder" ${(ad.link || hasMetaPreview) ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
 
-    const previewBtn = ad.link ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
+    const previewBtn = (ad.link || hasMetaPreview) ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
     const downloadBtn = fileId ? `<button class="btn" style="background:var(--blue-bg); color:var(--blue);" onclick="downloadDriveVideo('${fileId}', '${ad.name.replace(/['\\]/g, '')}')">\u2B07 Download</button>` : '';
     const aiBtn = ''; // per-card AI Analysis (thumbnail) button removed — use modal's Generate Variations / Full Video Analysis instead
     const wfBtn = ad.score < 5 ? `<button class="btn" style="background:var(--accent-bg); color:var(--accent);" onclick="sendToWorkflow(${ad.id})">+ Workflow</button>` : '';
@@ -2563,8 +2625,24 @@ function openModal(id) {
         switchPreviewMode('iframe');
       });
     }
+  } else if (ad.metaVideo || ad.metaThumb) {
+    // Creative resolved from the Meta API — render with a plain <video>
+    // (or just the thumbnail when no playable URL came back, e.g. image ads).
+    if (ad.metaVideo) {
+      previewArea.innerHTML = `
+        <video controls playsinline preload="metadata" ${ad.metaThumb ? `poster="${ad.metaThumb}"` : ''}
+               style="width:100%; max-height:480px; background:#000; border-radius:8px;">
+          <source src="${ad.metaVideo}" type="video/mp4">
+          Your browser does not support inline video playback.
+        </video>
+        <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Preview served directly from the Meta Marketing API. Signed URL refreshes hourly.</div>`;
+    } else {
+      previewArea.innerHTML = `
+        <img src="${ad.metaThumb}" alt="" style="width:100%; max-height:480px; object-fit:contain; background:#000; border-radius:8px;">
+        <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Image creative — no video available from Meta for this ad.</div>`;
+    }
   } else {
-    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">No creative link available. Connect your Google Sheet or add a "Drive Link" column to match this ad.</div>`;
+    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">No creative preview available yet. ${ad.adId ? 'Meta creative resolution may still be in flight — try again in a few seconds.' : 'Connect your Google Sheet or add a "Drive Link" column to match this ad.'}</div>`;
   }
 
   const modalMetrics = document.getElementById('modalMetrics');
