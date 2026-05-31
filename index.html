@@ -2234,14 +2234,14 @@ function buildDeepAnalysisPrompt(ad, isWin) {
   const failing = Object.keys(ad.failed).filter(k => !isNaN(ad.metrics[k])).map(k => BENCHMARKS[k].label).join(', ') || 'none';
   const passing = Object.keys(ad.passed).map(k => BENCHMARKS[k].label).join(', ') || 'none';
 
-  return `You are reviewing a Meta app-install video ad for Astrotalk (Vedic astrology / love & psychic consultation app \u2014 originally India, now scaling US/UK/EU). Watch the full video.
+  return `You are a top performance + creative director at Astrotalk (Vedic astrology / love & psychic consultation app \u2014 India, scaling US/UK/EU). You've just watched the full ad. Write a concise, scannable report the video editor can act on tomorrow.
 
 Rules:
-- Be OBSERVATIONAL. Name what you actually see/hear, with timestamps. No vague adjectives ("engaging", "compelling").
-- Quote dialogue verbatim where it matters.
-- If audio has a misspeak, accent issue, or muddy mix that hurts credibility, name the specific word and timestamp.
-- Tag insights with the metric they affect: [Hook] [Hold] [CTI] [CPI] [Brand] [Compliance].
+- Be OBSERVATIONAL. Name what you actually see and hear, with timestamps. No vague adjectives ("engaging", "compelling", "powerful").
+- Quote dialogue verbatim wherever it matters.
+- Tag every insight with the metric it affects: [Hook] [Hold] [CTI] [CPI] [Brand] [Compliance].
 - Use the headings exactly as below. No preamble. No closing summary.
+- Stay under 350 words total. Drop a section only if there's genuinely nothing to say there.
 
 CONTEXT: ${context}
 METRICS: CPI ${fmtR(m.cpi)} \u00b7 Hook ${fmt(m.hook,'%')} \u00b7 Hold ${fmt(m.hold,'%')} \u00b7 CTI ${fmt(m.cti,'%')} \u00b7 CPM ${fmtR(m.cpm)} \u00b7 Installs ${e.installs || 0} \u00b7 Spend ${fmtR(ad.spend)}
@@ -2250,30 +2250,31 @@ PASSING: ${passing}
 FAILING: ${failing}
 
 ## Verdict
-1 line \u2014 scale / iterate / kill \u2014 and the single biggest reason.
+One line \u2014 **scale | iterate | kill** \u2014 and the single biggest reason.
 
-## What's in the video
-- **Audio:** the actual line(s) spoken in quotes, with timestamps. Note language (Hindi / English / mix).
-- **Visual:** who/what/where in 1-2 sentences (faces, age range, setting, props, on-screen text).
+## Snapshot (one observation per dimension)
+- **Hook (0:00-0:03):** what literally happens on screen + the craft choice driving it. [Hook]
+- **Hold (mid):** pacing, beat shape, where attention dips or spikes. [Hold]
+- **Script:** premise in one line + the strongest line in quotes with its timestamp.
+- **Visuals:** framing, cut density, b-roll quality, on-screen text, any production red flag.
+- **Voice modulation:** pitch / pause / emphasis pattern. Quote one moment that nails it or breaks it, with timestamp.
+- **Sound effects / music:** specific cues that lift or drag, with timestamps. Note mix issues.
+- **Topic / pain point:** the exact life situation it taps.
+- **Relatability:** the specific cohort it lands with \u2014 and who it misses.
 
-## What works
-3-5 specific things with timestamps where relevant. Each tagged with the metric it likely lifts.
+## Why it works
+3 bullets. Concrete craft choices with timestamps. Tag the metric each lifts.
 
-## What's breaking it
-3-5 numbered issues with evidence. Cite timestamp + failing metric. For misspeak/accent/audio issues, name the exact word and timestamp.
+## Why it's losing
+3 bullets. Each with a timestamp + the failing metric. For misspeaks/accent/mix issues, name the exact word.
 
-## Specific changes (timestamped)
-4-6 bullets. Each: \`timestamp\` + exact change (replace / add / cut / reframe \u2014 say which). For rewrites, give the new line in quotes. For overlays, give the on-screen text. Tie each change to the metric it should move.
-
-## Audio / VO direction
-2-3 cues: where to lift pitch, where to drop, where to add a half-beat pause, words to emphasize. Reference timestamps. Note any accent/credibility issues.
+## Fix list (timestamped)
+4-6 bullets. Each: \`timestamp\` + exact change (replace / add / cut / reframe \u2014 say which). For rewrites, give the new line in quotes. Tie each fix to the metric it should move.
 
 ## 3 variations to test next
-1. **Cut variation** (target: Hook/Hold) \u2014 different opening cut or new b-roll insert. Be specific: new in/out points, or what footage to splice.
-2. **Script variation** (target: CTI/Hook) \u2014 exact rewrite of the key line(s) in quotes.
-3. **CTA / end-card variation** (target: CTI) \u2014 different ask, different urgency, different proof element (screen recording, app badge, free-trial pitch).
-
-Keep total under 350 words. Drop a section only if there's genuinely nothing to say there.`;
+1. **Cut variation** [Hold] \u2014 specific new in/out points or b-roll splice.
+2. **Script variation** [CTI] \u2014 exact rewrite of the key line in quotes.
+3. **CTA / end-card variation** [CTI] \u2014 different ask, urgency, or proof element.`;
 }
 
 // Headless video upload to Gemini File API. Reports progress via callback.
