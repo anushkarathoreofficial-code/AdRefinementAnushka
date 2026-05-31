@@ -1831,16 +1831,20 @@ function renderDashboard() {
     let fileId = ad.link ? getDriveFileId(ad.link) : null;
     const folderId = (!fileId && ad.link) ? getDriveFolderId(ad.link) : null;
     if (!fileId && folderId && _folderResolveCache[folderId]) fileId = _folderResolveCache[folderId];
-    const hasMetaPreview = !!(ad.metaVideo || ad.metaThumb);
+    // Any ad with an adId can be previewed \u2014 even before its Meta creative
+    // is resolved \u2014 because openModal() lazily fetches /api/ad-creative on
+    // click and shows a "Loading creative from Meta\u2026" spinner in the
+    // meantime. ad.link covers the Drive-sheet path.
+    const previewable = !!(ad.link || ad.adId);
     const thumbHTML = fileId
       ? `<img class="card-thumb" src="https://drive.google.com/thumbnail?id=${fileId}&sz=w200" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
       : folderId
         ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
         : ad.metaThumb
           ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
-          : `<div class="card-thumb-placeholder" ${(ad.link || hasMetaPreview) ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
+          : `<div class="card-thumb-placeholder" ${previewable ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
 
-    const previewBtn = (ad.link || hasMetaPreview) ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
+    const previewBtn = previewable ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
     const downloadBtn = fileId ? `<button class="btn" style="background:var(--blue-bg); color:var(--blue);" onclick="downloadDriveVideo('${fileId}', '${ad.name.replace(/['\\]/g, '')}')">\u2B07 Download</button>` : '';
     const aiBtn = ''; // per-card AI Analysis (thumbnail) button removed — use modal's Generate Variations / Full Video Analysis instead
     const wfBtn = ad.score < 5 ? `<button class="btn" style="background:var(--accent-bg); color:var(--accent);" onclick="sendToWorkflow(${ad.id})">+ Workflow</button>` : '';
