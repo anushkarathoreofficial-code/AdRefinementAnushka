@@ -1288,6 +1288,17 @@ function parseCSVRows(text, sep) {
 // vs hyphen are also frequent mismatches.
 function normalizeAdName(s) {
   let n = String(s || '').toLowerCase();
+  // Strip emojis + emoji variation selectors. Ad names on the Meta side
+  // sometimes get prefixed with ✅, 🔥, etc. that aren't in the sheet —
+  // without this they'd derail the bigram/jaccard match. \p{Extended_Pictographic}
+  // covers all standard emojis; ️ is the variation-16 selector.
+  try {
+    n = n.replace(/[\p{Extended_Pictographic}️‍]/gu, '');
+  } catch (_) {
+    // Fallback for engines without Unicode property escapes — covers the
+    // most common emoji ranges (misc symbols + supplemental symbols).
+    n = n.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}️‍]/gu, '');
+  }
   // Unify dashes (en/em-dash -> hyphen)
   n = n.replace(/[–—]/g, '-');
   // Strip trailing "- Copy", "- Copy 2", repeated. Meta does this on duplication.
