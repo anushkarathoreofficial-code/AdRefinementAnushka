@@ -2,12 +2,13 @@
  * Tiny Express server for Railway (or any Node host).
  *
  * Env vars:
- *   META_CSV_URL     — (legacy) published Google Sheet CSV for Meta ads data
- *   LINKS_CSV_URL    — published Google Sheet CSV for ad-name → Drive link
- *   DRIVE_API_KEY    — Google Drive API key (used for folder resolution)
- *   META_TOKEN       — Meta Marketing API long-lived access token
- *   META_AD_ACCOUNT  — Meta ad account, e.g. "act_123456789"
- *   META_DATE_PRESET — optional, defaults to "last_7d"
+ *   META_CSV_URL       — (legacy) published Google Sheet CSV for Meta ads data
+ *   LINKS_CSV_URL      — published Google Sheet CSV for ad-name → Drive link
+ *   DRIVE_API_KEY      — Google Drive API key (used for folder resolution)
+ *   META_TOKEN         — Meta Marketing API long-lived access token
+ *   META_AD_ACCOUNT    — Meta ad account, e.g. "act_123456789"
+ *   META_DATE_PRESET   — optional, defaults to "last_7d"
+ *   META_CAMPAIGN_IDS  — optional, comma-separated campaign ids to limit to
  *
  * If META_TOKEN + META_AD_ACCOUNT are set, the dashboard pulls ad metrics
  * live from the Meta Graph API via /api/meta-insights.csv. Otherwise it
@@ -71,7 +72,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
   }
   const datePreset = req.query.date_preset || process.env.META_DATE_PRESET || 'last_7d';
   const fields = [
-    'ad_id','ad_name','adset_name','campaign_name',
+    'ad_id','ad_name','adset_name','campaign_id','campaign_name',
     'spend','impressions','reach','frequency',
     'clicks','inline_link_clicks','ctr','cpm','cpc',
     'actions','cost_per_action_type',
@@ -79,10 +80,22 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     'date_start','date_stop'
   ].join(',');
 
+  // Optional campaign-id filter (env var, overridable per-request).
+  const campaignIdsRaw = (req.query.campaign_ids || process.env.META_CAMPAIGN_IDS || '').trim();
+  const campaignIds = campaignIdsRaw
+    ? campaignIdsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    : [];
+  let filteringParam = '';
+  if (campaignIds.length) {
+    const filter = [{ field: 'campaign.id', operator: 'IN', value: campaignIds }];
+    filteringParam = `&filtering=${encodeURIComponent(JSON.stringify(filter))}`;
+  }
+
   const firstUrl =
     `https://graph.facebook.com/v21.0/${encodeURIComponent(account)}/insights` +
     `?level=ad&fields=${fields}` +
     `&date_preset=${encodeURIComponent(datePreset)}` +
+    filteringParam +
     `&limit=500&access_token=${encodeURIComponent(token)}`;
 
   try {
@@ -109,7 +122,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
 // ---------- helpers ----------
 function buildInsightsCSV(rows) {
   const header = [
-    'Ad Name','Campaign','Ad Set','Date',
+    'Ad Name','Campaign','Campaign ID','Ad Set','Date',
     'Spend','Impressions','Reach','Frequency',
     'Clicks','CTR','CPM','CPC',
     'Installs','CPI','Hook Rate','Hold Rate','CTI'
@@ -145,6 +158,7 @@ function buildInsightsCSV(rows) {
     lines.push([
       csvField(row.ad_name || ''),
       csvField(row.campaign_name || ''),
+      csvField(row.campaign_id || ''),
       csvField(row.adset_name || ''),
       csvField(row.date_start || ''),
       row.spend || '',
