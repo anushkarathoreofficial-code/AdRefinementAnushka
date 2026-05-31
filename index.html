@@ -3359,9 +3359,17 @@ async function fetchStoredAnalysis(adId) {
   } catch (_) { return null; }
 }
 
+// CPI threshold for "save this analysis to history". Only winning ads
+// (CPI < ₹300) flow into the training data, so when "past winners' patterns"
+// gets injected into future prompts it's actually showing winners — not
+// noise from analyses we ran on weak creatives just to study them.
+const ANALYSIS_HISTORY_CPI_MAX = 300;
+
 async function saveAnalysisToHistory(ad, mode, responseText) {
   if (!BACKEND.analysisHistoryEnabled) return;
   if (!ad || !ad.adId || !responseText) return; // need a real Meta ad id to key on
+  const cpi = ad.metrics && ad.metrics.cpi;
+  if (isNaN(cpi) || cpi >= ANALYSIS_HISTORY_CPI_MAX) return; // gate: winners only
   try {
     await fetch('/api/save-analysis', {
       method: 'POST', credentials: 'same-origin', cache: 'no-store',

@@ -400,6 +400,10 @@ function normalizeAdNameServer(s) {
   return n.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
+// History only collects winners (CPI < ₹300). Mirrors the client gate so a
+// bad request can't pollute the shared "past winners" pool.
+const ANALYSIS_HISTORY_CPI_MAX = 300;
+
 app.post('/api/save-analysis', async (req, res) => {
   res.set('Cache-Control', 'no-store');
   if (!hasAnalysisHistory()) {
@@ -410,6 +414,11 @@ app.post('/api/save-analysis', async (req, res) => {
   const snapshot = String(b.snapshot || '').trim();
   if (!adId || !snapshot) return res.status(400).json({ error: 'ad_id and snapshot are required' });
   if (snapshot.length > 50000) return res.status(413).json({ error: 'snapshot too large (50k max)' });
+  // Winners-only gate.
+  const cpi = parseFloat((b.metrics && b.metrics.cpi) ?? '');
+  if (isNaN(cpi) || cpi >= ANALYSIS_HISTORY_CPI_MAX) {
+    return res.status(200).json({ ok: true, skipped: true, reason: `CPI ${isNaN(cpi) ? 'missing' : '≥ ₹' + ANALYSIS_HISTORY_CPI_MAX} — winners-only history` });
+  }
   try {
     await ensureAnalysisTab();
     const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
@@ -489,16 +498,19 @@ app.get('/api/recent-winners', async (req, res) => {
     const rows = result.data.values || [];
     const winners = [];
     for (let i = rows.length - 1; i >= 1 && winners.length < limit * 4; i--) {
-      const score = parseInt(rows[i][4], 10);
-      if (!isNaN(score) && score >= 4) {
-        winners.push({
-          created_at: rows[i][0] || '',
-          ad_name: rows[i][2] || '',
-          score,
-          metrics: tryParseJSON(rows[i][5]) || {},
-          snapshot: rows[i][6] || ''
-        });
-      }
+      const metrics = tryParseJSON(rows[i][5]) || {};
+      const cpi = parseFloat(metrics.cpi);
+      // CPI gate: only proven low-cost ads count as "winners" worth
+      // referencing in future analyses. Defends against legacy rows that
+      // landed in the sheet before the gate existed.
+      if (isNaN(cpi) || cpi >= ANALYSIS_HISTORY_CPI_MAX) continue;
+      winners.push({
+        created_at: rows[i][0] || '',
+        ad_name: rows[i][2] || '',
+        score: parseInt(rows[i][4], 10) || 0,
+        metrics,
+        snapshot: rows[i][6] || ''
+      });
     }
     res.json({ winners: winners.slice(0, limit) });
   } catch (err) {
