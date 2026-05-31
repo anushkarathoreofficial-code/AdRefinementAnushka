@@ -268,7 +268,7 @@ app.get('/api/ad-creative', async (req, res) => {
 
     const creative = adData.creative || {};
     const videoId = extractVideoId(creative);
-    const thumb   = extractThumbnail(creative);
+    let thumb     = extractThumbnail(creative);
 
     let videoUrl = '';
     if (videoId) {
@@ -277,6 +277,25 @@ app.get('/api/ad-creative', async (req, res) => {
       const vidRes = await fetch(vidUrl);
       const vidData = await vidRes.json();
       if (vidRes.ok && !vidData.error && vidData.source) videoUrl = vidData.source;
+    }
+
+    // Many promoted-post-style video ads don't expose video_id anywhere on
+    // the creative — the video lives on the underlying Page post. Pull it
+    // from the post's attachments as a last resort. media.source IS the
+    // playable URL, so no second lookup needed.
+    if (!videoUrl && creative.effective_object_story_id) {
+      try {
+        const postUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(creative.effective_object_story_id)}` +
+                        `?fields=attachments{media,media_type,subattachments}` +
+                        `&access_token=${encodeURIComponent(token)}`;
+        const postRes = await fetch(postUrl);
+        const postData = await postRes.json();
+        if (postRes.ok && !postData.error) {
+          const found = extractFromPostAttachments(postData.attachments);
+          if (found.video_url) videoUrl = found.video_url;
+          if (!thumb && found.thumb) thumb = found.thumb;
+        }
+      } catch (_) { /* non-fatal: thumbnail-only fallback still works */ }
     }
 
     const data = {
@@ -303,6 +322,28 @@ function extractVideoId(creative) {
     for (const v of afsv) if (v && v.video_id) return String(v.video_id);
   }
   return '';
+}
+
+// Walks a post's attachments tree to find the first video source + thumbnail.
+// Used as a last-resort fallback when the ad creative didn't expose video_id
+// (typical for promoted Page posts).
+function extractFromPostAttachments(attachments) {
+  const out = { video_url: '', thumb: '' };
+  if (!attachments || !Array.isArray(attachments.data)) return out;
+  const walk = (nodes) => {
+    for (const node of nodes) {
+      if (!node) continue;
+      const media = node.media || {};
+      if (!out.video_url && media.source) out.video_url = media.source;
+      if (!out.thumb && media.image && media.image.src) out.thumb = media.image.src;
+      if (node.subattachments && Array.isArray(node.subattachments.data)) {
+        walk(node.subattachments.data);
+      }
+      if (out.video_url && out.thumb) return;
+    }
+  };
+  walk(attachments.data);
+  return out;
 }
 
 function extractThumbnail(creative) {
