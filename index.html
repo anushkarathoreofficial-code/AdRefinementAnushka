@@ -1096,13 +1096,15 @@ function attachCardCreativeObserver() {
       const el = entry.target;
       const adId = +el.getAttribute('data-ad-id');
       const ad = allAds.find(a => a.id === adId);
-      if (!ad || !ad.adId || ad.link) { obs.unobserve(el); continue; }
+      // Resolve Meta thumbs for EVERY ad with an adId, including ones that
+      // already have a Drive link — Drive thumbnails fail for files shared
+      // with restricted access, so Meta is the reliable thumbnail source.
+      // The modal still prefers Drive for actual video playback.
+      if (!ad || !ad.adId) { obs.unobserve(el); continue; }
       if (ad.metaVideo || ad.metaThumb) { obs.unobserve(el); continue; }
       obs.unobserve(el);
       _fetchAdCreativeIfNeeded(ad).then(() => {
         if (ad.metaVideo || ad.metaThumb) {
-          // One card re-rendered ≪ full re-render, but renderDashboard is
-          // cheap (~ms for hundreds of cards) and keeps state consistent.
           if (typeof renderDashboard === 'function') renderDashboard();
         }
       });
@@ -1843,17 +1845,19 @@ function renderDashboard() {
     let fileId = ad.link ? getDriveFileId(ad.link) : null;
     const folderId = (!fileId && ad.link) ? getDriveFolderId(ad.link) : null;
     if (!fileId && folderId && _folderResolveCache[folderId]) fileId = _folderResolveCache[folderId];
-    // Any ad with an adId can be previewed \u2014 even before its Meta creative
-    // is resolved \u2014 because openModal() lazily fetches /api/ad-creative on
-    // click and shows a "Loading creative from Meta\u2026" spinner in the
-    // meantime. ad.link covers the Drive-sheet path.
+    // Any ad with an adId can be previewed \u2014 openModal() lazily fetches the
+    // creative on click and shows a spinner in the meantime. ad.link covers
+    // the Drive-sheet path.
     const previewable = !!(ad.link || ad.adId);
-    const thumbHTML = fileId
-      ? `<img class="card-thumb" src="https://drive.google.com/thumbnail?id=${fileId}&sz=w200" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
-      : folderId
-        ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
-        : ad.metaThumb
-          ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
+    // Thumbnail priority: Meta thumb > Drive thumb > folder placeholder >
+    // generic placeholder. Meta wins because Drive thumbnails fail silently
+    // for files shared with restricted access \u2014 Meta's CDN is universal.
+    const thumbHTML = ad.metaThumb
+      ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
+      : fileId
+        ? `<img class="card-thumb" src="https://drive.google.com/thumbnail?id=${fileId}&sz=w200" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
+        : folderId
+          ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
           : `<div class="card-thumb-placeholder" ${previewable ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
 
     const previewBtn = previewable ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
