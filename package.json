@@ -4,12 +4,14 @@
   "description": "Astrotalk ad refinement dashboard with Google Sheets backend",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "hash-password": "node scripts/hash-password.js"
   },
   "engines": {
     "node": ">=18"
   },
   "dependencies": {
+    "bcryptjs": "^2.4.3",
     "express": "^4.19.2",
     "googleapis": "^144.0.0"
   }

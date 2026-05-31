@@ -2,10 +2,13 @@
  * Tiny Express server for Railway (or any Node host).
  *
  * Env vars:
- *   DASHBOARD_PASSWORD       — required in production. Shared secret that gates
- *                              every data endpoint (/config.json, /api/*).
- *                              If unset, the server runs in OPEN mode and prints
- *                              a warning. Never deploy without it.
+ *   DASHBOARD_PASSWORD_HASH  — bcrypt hash of the shared access password.
+ *                              Preferred over DASHBOARD_PASSWORD. Cost factor
+ *                              must be ≥ 10 (the server refuses to start
+ *                              otherwise). Generate with: npm run hash-password.
+ *   DASHBOARD_PASSWORD       — plaintext fallback. Used only when no _HASH is
+ *                              set. If both are unset, server runs in OPEN
+ *                              mode. Never deploy without one of them.
  *   META_CSV_URL             — (legacy) published Google Sheet CSV for Meta ads
  *   LINKS_CSV_URL            — published Google Sheet CSV for ad-name → Drive link
  *   DRIVE_API_KEY            — Google Drive API key (used for anonymous folder resolution)
@@ -39,6 +42,7 @@
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 // Railway terminates TLS at the edge; honour X-Forwarded-* so req.ip is real
@@ -47,22 +51,72 @@ app.set('trust proxy', true);
 app.disable('x-powered-by');
 
 // ---------------- CONFIG ----------------
-const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
-const AUTH_COOKIE_NAME = 'dashauth';
-const AUTH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const DASHBOARD_PASSWORD_HASH = process.env.DASHBOARD_PASSWORD_HASH || '';
+const DASHBOARD_PASSWORD      = process.env.DASHBOARD_PASSWORD || '';
+const AUTH_COOKIE_NAME        = 'dashauth';
+const AUTH_COOKIE_MAX_AGE_MS  = 7 * 24 * 60 * 60 * 1000;
+const BCRYPT_MIN_COST         = 10;
 
-if (!DASHBOARD_PASSWORD) {
+// Strict bcrypt format: $2[ayb]$<2-digit cost>$<22 salt chars><31 hash chars>
+function isValidBcryptHash(h) {
+  const m = String(h || '').match(/^\$2[ayb]\$(\d{2})\$[./A-Za-z0-9]{53}$/);
+  return m ? parseInt(m[1], 10) >= BCRYPT_MIN_COST : false;
+}
+
+if (DASHBOARD_PASSWORD_HASH) {
+  if (!isValidBcryptHash(DASHBOARD_PASSWORD_HASH)) {
+    console.error(
+      '\n  ✗  DASHBOARD_PASSWORD_HASH is invalid or has cost factor < ' + BCRYPT_MIN_COST + '.\n' +
+      '     Generate a fresh one with:  npm run hash-password\n'
+    );
+    process.exit(1);
+  }
+  if (DASHBOARD_PASSWORD) {
+    console.warn(
+      '\n  ⚠  Both DASHBOARD_PASSWORD_HASH and DASHBOARD_PASSWORD are set.\n' +
+      '     Using the hash; the plaintext value is ignored. Remove\n' +
+      '     DASHBOARD_PASSWORD from Railway → Variables to silence this.\n'
+    );
+  }
+} else if (DASHBOARD_PASSWORD) {
   console.warn(
-    '\n  ⚠  DASHBOARD_PASSWORD is not set — running in OPEN mode.\n' +
-    '     All data endpoints are publicly reachable. Set DASHBOARD_PASSWORD\n' +
-    '     in Railway → Variables before exposing this deployment.\n'
+    '\n  ⚠  Using plaintext DASHBOARD_PASSWORD. For better protection, switch\n' +
+    '     to DASHBOARD_PASSWORD_HASH (generate with: npm run hash-password).\n'
   );
-} else if (DASHBOARD_PASSWORD.length < 12) {
+  if (DASHBOARD_PASSWORD.length < 12) {
+    console.warn(
+      '  ⚠  DASHBOARD_PASSWORD is shorter than 12 characters. Pick a longer\n' +
+      '     value or move to a hash — this is the only barrier between the\n' +
+      '     public internet and your Meta ad data.\n'
+    );
+  }
+} else {
   console.warn(
-    '\n  ⚠  DASHBOARD_PASSWORD is shorter than 12 characters. Pick a longer\n' +
-    '     value — this is the only barrier between the public internet and\n' +
-    '     your Meta ad data.\n'
+    '\n  ⚠  Neither DASHBOARD_PASSWORD_HASH nor DASHBOARD_PASSWORD is set —\n' +
+    '     running in OPEN mode. All data endpoints are publicly reachable.\n' +
+    '     Set one of them in Railway → Variables before exposing this deployment.\n'
   );
+}
+
+// Single accessor for "is auth on?" — covers both hash and plaintext modes.
+function authEnabled() {
+  return !!(DASHBOARD_PASSWORD_HASH || DASHBOARD_PASSWORD);
+}
+
+// Cookie HMAC secret. Stable across restarts (same env var → same secret),
+// so cookies survive deploys without forcing everyone to re-login.
+function authSecret() {
+  return DASHBOARD_PASSWORD_HASH || DASHBOARD_PASSWORD;
+}
+
+// Verify a submitted password. Async because bcrypt.compare is, but the
+// plaintext branch resolves synchronously via Promise.resolve.
+async function verifyPassword(input) {
+  if (DASHBOARD_PASSWORD_HASH) {
+    try { return await bcrypt.compare(String(input || ''), DASHBOARD_PASSWORD_HASH); }
+    catch { return false; }
+  }
+  return safeEq(input, DASHBOARD_PASSWORD);
 }
 
 // ---------------- SECURITY HEADERS ----------------
@@ -93,19 +147,19 @@ function safeEq(a, b) {
 
 function makeAuthCookie() {
   const ts = String(Date.now());
-  const sig = crypto.createHmac('sha256', DASHBOARD_PASSWORD).update(ts).digest('hex');
+  const sig = crypto.createHmac('sha256', authSecret()).update(ts).digest('hex');
   return `${ts}.${sig}`;
 }
 
 function verifyAuthCookie(value) {
-  if (!DASHBOARD_PASSWORD) return false;
+  if (!authEnabled()) return false;
   if (!value || typeof value !== 'string') return false;
   const dot = value.indexOf('.');
   if (dot <= 0) return false;
   const ts = value.slice(0, dot);
   const sig = value.slice(dot + 1);
   if (!/^\d+$/.test(ts) || !/^[a-f0-9]+$/i.test(sig)) return false;
-  const expected = crypto.createHmac('sha256', DASHBOARD_PASSWORD).update(ts).digest('hex');
+  const expected = crypto.createHmac('sha256', authSecret()).update(ts).digest('hex');
   if (!safeEq(sig, expected)) return false;
   const age = Date.now() - parseInt(ts, 10);
   return age >= 0 && age <= AUTH_COOKIE_MAX_AGE_MS;
@@ -161,25 +215,24 @@ setInterval(() => {
 // ---------------- PUBLIC AUTH ENDPOINTS ----------------
 app.get('/api/auth-status', (req, res) => {
   res.set('Cache-Control', 'no-store');
-  if (!DASHBOARD_PASSWORD) return res.json({ required: false, authenticated: true });
+  if (!authEnabled()) return res.json({ required: false, authenticated: true });
   res.json({
     required: true,
     authenticated: verifyAuthCookie(readCookie(req, AUTH_COOKIE_NAME))
   });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', async (req, res) => {
   res.set('Cache-Control', 'no-store');
-  if (!DASHBOARD_PASSWORD) {
-    return res.status(503).json({ error: 'login disabled (DASHBOARD_PASSWORD not set)' });
+  if (!authEnabled()) {
+    return res.status(503).json({ error: 'login disabled (no password configured)' });
   }
   if (!loginAllowed(req)) {
     return res.status(429).json({ error: 'Too many attempts. Try again in a minute.' });
   }
   const password = (req.body && typeof req.body.password === 'string') ? req.body.password : '';
-  if (!safeEq(password, DASHBOARD_PASSWORD)) {
-    return res.status(401).json({ error: 'Invalid password.' });
-  }
+  const ok = await verifyPassword(password);
+  if (!ok) return res.status(401).json({ error: 'Invalid password.' });
   setAuthCookie(req, res, makeAuthCookie());
   res.json({ ok: true });
 });
@@ -192,7 +245,7 @@ app.post('/api/logout', (req, res) => {
 
 // ---------------- AUTH GATE (everything below requires login) ----------------
 function requireAuth(req, res, next) {
-  if (!DASHBOARD_PASSWORD) return next(); // OPEN mode, warned at boot
+  if (!authEnabled()) return next(); // OPEN mode, warned at boot
   if (verifyAuthCookie(readCookie(req, AUTH_COOKIE_NAME))) return next();
   res.set('Cache-Control', 'no-store');
   res.status(401).json({ error: 'auth required' });
