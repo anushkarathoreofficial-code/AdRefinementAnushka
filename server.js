@@ -248,8 +248,16 @@ app.get('/api/ad-creative', async (req, res) => {
   if (cached && cached.expiresAt > Date.now()) return res.json(cached.data);
 
   try {
+    // Meta stores video creative in several places depending on ad type.
+    // Pull every plausible location in one shot so we don't have to guess.
+    const creativeFields = [
+      'video_id','thumbnail_url','image_url',
+      'object_story_spec{video_data{video_id,image_url}}',
+      'asset_feed_spec{videos{video_id,thumbnail_url,url},images{url}}',
+      'effective_object_story_id'
+    ].join(',');
     const adUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(adId)}` +
-                  `?fields=creative{video_id,thumbnail_url,image_url}` +
+                  `?fields=creative{${creativeFields}}` +
                   `&access_token=${encodeURIComponent(token)}`;
     const adRes = await fetch(adUrl);
     const adData = await adRes.json();
@@ -257,18 +265,23 @@ app.get('/api/ad-creative', async (req, res) => {
       const msg = adData.error ? `${adData.error.message} (code ${adData.error.code})` : `HTTP ${adRes.status}`;
       return res.status(502).json({ error: 'Meta API error: ' + msg });
     }
+
     const creative = adData.creative || {};
+    const videoId = extractVideoId(creative);
+    const thumb   = extractThumbnail(creative);
+
     let videoUrl = '';
-    if (creative.video_id) {
-      const vidUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(creative.video_id)}` +
+    if (videoId) {
+      const vidUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}` +
                      `?fields=source&access_token=${encodeURIComponent(token)}`;
       const vidRes = await fetch(vidUrl);
       const vidData = await vidRes.json();
       if (vidRes.ok && !vidData.error && vidData.source) videoUrl = vidData.source;
     }
+
     const data = {
       video_url: videoUrl,
-      thumbnail_url: creative.thumbnail_url || '',
+      thumbnail_url: thumb,
       image_url: creative.image_url || ''
     };
     creativeCache.set(adId, { data, expiresAt: Date.now() + CREATIVE_TTL_MS });
@@ -277,6 +290,37 @@ app.get('/api/ad-creative', async (req, res) => {
     res.status(502).json({ error: 'Meta API fetch failed.' });
   }
 });
+
+// Meta wraps the video id in a different node for each ad type. Walk every
+// known location and return the first one that exists.
+function extractVideoId(creative) {
+  if (!creative) return '';
+  if (creative.video_id) return String(creative.video_id);
+  const ossv = creative.object_story_spec && creative.object_story_spec.video_data;
+  if (ossv && ossv.video_id) return String(ossv.video_id);
+  const afsv = creative.asset_feed_spec && creative.asset_feed_spec.videos;
+  if (Array.isArray(afsv)) {
+    for (const v of afsv) if (v && v.video_id) return String(v.video_id);
+  }
+  return '';
+}
+
+function extractThumbnail(creative) {
+  if (!creative) return '';
+  if (creative.thumbnail_url) return creative.thumbnail_url;
+  const afsv = creative.asset_feed_spec && creative.asset_feed_spec.videos;
+  if (Array.isArray(afsv)) {
+    for (const v of afsv) if (v && v.thumbnail_url) return v.thumbnail_url;
+  }
+  const ossv = creative.object_story_spec && creative.object_story_spec.video_data;
+  if (ossv && ossv.image_url) return ossv.image_url;
+  if (creative.image_url) return creative.image_url;
+  const afsi = creative.asset_feed_spec && creative.asset_feed_spec.images;
+  if (Array.isArray(afsi)) {
+    for (const i of afsi) if (i && i.url) return i.url;
+  }
+  return '';
+}
 
 // ---------------- Meta API: full ad-level insights as CSV ----------------
 app.get('/api/meta-insights.csv', async (req, res) => {
