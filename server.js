@@ -21,6 +21,11 @@
  *                              user gets the Gemini AI analysis features
  *                              wired up automatically without pasting their
  *                              own key. Exposed via /config.json (auth-gated).
+ *   ANALYSIS_SHEET_ID        — optional. ID of a Google Sheet (shared with
+ *                              the service account as Editor) that the
+ *                              dashboard appends every completed analysis
+ *                              into. Enables "what worked in past" context
+ *                              for new analyses. Requires GOOGLE_CREDENTIALS_JSON.
  *
  * Security model:
  *   - The Meta token never leaves the server. The browser only sees the
@@ -213,7 +218,10 @@ app.get('/config.json', (req, res) => {
     // When set, the dashboard auto-fills the Gemini AI key on every
     // load so users don't have to paste it individually. Only sent
     // over the authed /config.json — never reachable anonymously.
-    geminiApiKey:      process.env.GEMINI_API_KEY || ''
+    geminiApiKey:      process.env.GEMINI_API_KEY || '',
+    // When true, the dashboard saves every analysis to the configured
+    // sheet and pulls past winners' patterns as prompt context.
+    analysisHistoryEnabled: !!(process.env.ANALYSIS_SHEET_ID && process.env.GOOGLE_CREDENTIALS_JSON)
   });
 });
 
@@ -325,6 +333,182 @@ app.get('/api/drive-thumbnail', async (req, res) => {
     res.status(502).end();
   }
 });
+
+// ---------------- Analysis history (Google Sheets persistence) ----------------
+// Every completed AI analysis is appended to a "Analysis Log" tab on the
+// configured sheet. The tab is created lazily on first write. Used by the
+// client to (a) render instantly when re-opening a previously analyzed ad
+// and (b) inject "past winners' patterns" into new analysis prompts.
+const ANALYSIS_TAB = 'Analysis Log';
+const ANALYSIS_HEADERS = [
+  'created_at', 'ad_id', 'ad_name', 'normalized_name',
+  'score', 'metrics_json', 'snapshot', 'provider', 'model'
+];
+let _analysisTabReady = false; // module-level cache — only do the existence check once
+
+function hasAnalysisHistory() {
+  return !!(process.env.ANALYSIS_SHEET_ID && hasDriveSA());
+}
+
+let _sheetsAuth = null;
+function getSheetsAuth() {
+  if (_sheetsAuth) return _sheetsAuth;
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+  _sheetsAuth = new (getGoogle().auth.GoogleAuth)({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/spreadsheets']
+  });
+  return _sheetsAuth;
+}
+
+async function ensureAnalysisTab() {
+  if (_analysisTabReady) return;
+  const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+  const sheetId = process.env.ANALYSIS_SHEET_ID;
+  const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: 'sheets.properties' });
+  const exists = (meta.data.sheets || []).some(s => s.properties && s.properties.title === ANALYSIS_TAB);
+  if (!exists) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: { requests: [{ addSheet: { properties: { title: ANALYSIS_TAB } } }] }
+    });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: sheetId,
+      range: `${ANALYSIS_TAB}!A1:I1`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [ANALYSIS_HEADERS] }
+    });
+  }
+  _analysisTabReady = true;
+}
+
+// Same emoji/copy stripping as the client uses, so saved rows are matchable
+// later via the normalized_name column.
+function _stripEmojiServer(s) {
+  try { return s.replace(/[\p{Extended_Pictographic}️‍]/gu, ''); }
+  catch { return s.replace(/[\u{1F300}-\u{1F9FF}\u{2600}-\u{27BF}️]/gu, ''); }
+}
+function normalizeAdNameServer(s) {
+  let n = String(s || '').toLowerCase();
+  n = _stripEmojiServer(n);
+  n = n.replace(/[–—]/g, '-');
+  while (true) {
+    const before = n;
+    n = n.replace(/\s*-\s*copy(\s*\d+)?\s*$/i, '');
+    if (n === before) break;
+  }
+  return n.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+app.post('/api/save-analysis', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasAnalysisHistory()) {
+    return res.status(503).json({ error: 'Set ANALYSIS_SHEET_ID + GOOGLE_CREDENTIALS_JSON to enable history.' });
+  }
+  const b = req.body || {};
+  const adId = String(b.ad_id || '').trim();
+  const snapshot = String(b.snapshot || '').trim();
+  if (!adId || !snapshot) return res.status(400).json({ error: 'ad_id and snapshot are required' });
+  if (snapshot.length > 50000) return res.status(413).json({ error: 'snapshot too large (50k max)' });
+  try {
+    await ensureAnalysisTab();
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const row = [
+      new Date().toISOString(),
+      adId,
+      String(b.ad_name || ''),
+      normalizeAdNameServer(b.ad_name || ''),
+      b.score == null ? '' : String(b.score),
+      JSON.stringify(b.metrics || {}),
+      snapshot,
+      String(b.provider || ''),
+      String(b.model || '')
+    ];
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: process.env.ANALYSIS_SHEET_ID,
+      range: `${ANALYSIS_TAB}!A:I`,
+      valueInputOption: 'RAW',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody: { values: [row] }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = (err.errors && err.errors[0] && err.errors[0].message) || err.message || 'unknown';
+    res.status(502).json({ error: 'sheet write failed: ' + msg });
+  }
+});
+
+// Return the most recent stored analysis for a given ad_id. Used to
+// short-circuit the Gemini upload when re-opening an analyzed ad.
+app.get('/api/analysis-for-ad', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasAnalysisHistory()) return res.json({ found: false });
+  const adId = String(req.query.ad_id || '').trim();
+  if (!adId) return res.status(400).json({ error: 'ad_id required' });
+  try {
+    await ensureAnalysisTab();
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.ANALYSIS_SHEET_ID,
+      range: `${ANALYSIS_TAB}!A:I`
+    });
+    const rows = result.data.values || [];
+    for (let i = rows.length - 1; i >= 1; i--) {
+      if (rows[i] && rows[i][1] === adId) {
+        return res.json({
+          found: true,
+          created_at: rows[i][0] || '',
+          ad_name: rows[i][2] || '',
+          score: rows[i][4] || '',
+          metrics: tryParseJSON(rows[i][5]) || {},
+          snapshot: rows[i][6] || '',
+          provider: rows[i][7] || '',
+          model: rows[i][8] || ''
+        });
+      }
+    }
+    res.json({ found: false });
+  } catch (err) {
+    res.status(502).json({ error: 'sheet read failed' });
+  }
+});
+
+// Return the N most recent winners (score >= 4) so the client can include
+// their snapshots in new analysis prompts as "what worked in past" context.
+app.get('/api/recent-winners', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasAnalysisHistory()) return res.json({ winners: [] });
+  const limit = Math.min(parseInt(req.query.limit, 10) || 3, 10);
+  try {
+    await ensureAnalysisTab();
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: process.env.ANALYSIS_SHEET_ID,
+      range: `${ANALYSIS_TAB}!A:I`
+    });
+    const rows = result.data.values || [];
+    const winners = [];
+    for (let i = rows.length - 1; i >= 1 && winners.length < limit * 4; i--) {
+      const score = parseInt(rows[i][4], 10);
+      if (!isNaN(score) && score >= 4) {
+        winners.push({
+          created_at: rows[i][0] || '',
+          ad_name: rows[i][2] || '',
+          score,
+          metrics: tryParseJSON(rows[i][5]) || {},
+          snapshot: rows[i][6] || ''
+        });
+      }
+    }
+    res.json({ winners: winners.slice(0, limit) });
+  } catch (err) {
+    res.status(502).json({ error: 'sheet read failed' });
+  }
+});
+
+function tryParseJSON(s) {
+  try { return JSON.parse(s); } catch { return null; }
+}
 
 // ---------------- Meta API: connection test ----------------
 app.get('/api/ad-metrics', async (req, res) => {

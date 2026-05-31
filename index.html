@@ -1000,7 +1000,11 @@ const BACKEND = {
   // When the server has GOOGLE_CREDENTIALS_JSON set, route Drive thumbnails
   // and video bytes through the server (service-account proxy). Lets us
   // play files behind a "sign-in required" sharing policy.
-  driveProxyEnabled: false
+  driveProxyEnabled: false,
+  // When the server has ANALYSIS_SHEET_ID set, every completed Gemini
+  // analysis is persisted, instantly re-rendered on modal re-open, and
+  // recent winners are injected into new analysis prompts as context.
+  analysisHistoryEnabled: false
 };
 
 // Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). The
@@ -1126,6 +1130,7 @@ async function _loadRuntimeConfig() {
     BACKEND.linksCsvUrl       = cfg.linksCsvUrl || '';
     BACKEND.metaApiUrl        = cfg.metaApiUrl  || '';
     BACKEND.driveProxyEnabled = !!cfg.driveProxyEnabled;
+    BACKEND.analysisHistoryEnabled = !!cfg.analysisHistoryEnabled;
     if (cfg.driveApiKey) _runtimeDriveApiKey = cfg.driveApiKey;
     if (cfg.geminiApiKey) _runtimeGeminiKey = cfg.geminiApiKey;
   } catch (e) {
@@ -2221,7 +2226,7 @@ let _strategistRunning = false;
 
 // Per-creative deep-analysis prompt. This is the file's most important prompt \u2014
 // it's what makes the strategist see things humans can't articulate from numbers.
-function buildDeepAnalysisPrompt(ad, isWin) {
+function buildDeepAnalysisPrompt(ad, isWin, pastWinners) {
   const m = ad.metrics;
   const e = ad.extra || {};
   const fmt = (v, suffix='') => isNaN(v) ? '\u2014' : v.toFixed(1) + suffix;
@@ -2248,7 +2253,7 @@ METRICS: CPI ${fmtR(m.cpi)} \u00b7 Hook ${fmt(m.hook,'%')} \u00b7 Hold ${fmt(m.h
 BENCHMARKS: CPI<\u20b9350 \u00b7 Hook>30% \u00b7 Hold>40% \u00b7 CTI>20% \u00b7 CPM<\u20b91500
 PASSING: ${passing}
 FAILING: ${failing}
-
+${formatPastWinnersForPrompt(pastWinners)}
 ## Verdict
 One line \u2014 **scale | iterate | kill** \u2014 and the single biggest reason.
 
@@ -3327,6 +3332,64 @@ let aiProvider = 'gemini'; // 'gemini' | 'openai' | 'claude'
 let currentModalAdId = null;
 let aiCache = {}; // cache results by ad id
 
+// ============ ANALYSIS HISTORY (server-persisted via /api/save-analysis) ============
+// In-memory cache of "have we already checked storage for this ad's analysis?"
+// Lets the modal-open path short-circuit without spamming /api/analysis-for-ad
+// when the user clicks around quickly.
+const _storedAnalysisProbed = new Set();
+
+async function fetchPastWinners() {
+  if (!BACKEND.analysisHistoryEnabled) return [];
+  try {
+    const r = await fetch('/api/recent-winners?limit=3', { credentials: 'same-origin', cache: 'no-store' });
+    if (!r.ok) return [];
+    const data = await r.json();
+    return Array.isArray(data.winners) ? data.winners : [];
+  } catch (_) { return []; }
+}
+
+async function fetchStoredAnalysis(adId) {
+  if (!BACKEND.analysisHistoryEnabled) return null;
+  try {
+    const r = await fetch('/api/analysis-for-ad?ad_id=' + encodeURIComponent(adId),
+                          { credentials: 'same-origin', cache: 'no-store' });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data && data.found ? data : null;
+  } catch (_) { return null; }
+}
+
+async function saveAnalysisToHistory(ad, mode, responseText) {
+  if (!BACKEND.analysisHistoryEnabled) return;
+  if (!ad || !ad.adId || !responseText) return; // need a real Meta ad id to key on
+  try {
+    await fetch('/api/save-analysis', {
+      method: 'POST', credentials: 'same-origin', cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ad_id: ad.adId,
+        ad_name: ad.name,
+        score: ad.score,
+        metrics: ad.metrics,
+        snapshot: responseText,
+        provider: aiProvider,
+        model: document.getElementById('aiModelSelect') ? document.getElementById('aiModelSelect').value : ''
+      })
+    });
+  } catch (_) { /* non-fatal: history write is best-effort */ }
+}
+
+// Format a stored analysis into the same card the live analysis renders into,
+// with a small "Saved" badge showing when it was first analyzed.
+function renderStoredAnalysisIntoModal(stored, mode) {
+  const headLabel = mode === 'variations' ? '3 Variations from Gemini' : 'Full Video Analysis by Gemini';
+  const when = stored.created_at ? new Date(stored.created_at).toLocaleString() : '';
+  return `<div class="ai-result" style="border-color:rgba(240,223,32,.3); background:linear-gradient(135deg, rgba(240,223,32,.06), rgba(240,160,48,.06));">
+    <h4 style="color:var(--accent);">${headLabel} <span style="font-size:10px; background:var(--accent-bg); color:var(--accent); padding:2px 6px; border-radius:3px; margin-left:6px;">Saved · ${when}</span></h4>
+    <div class="ai-result-content">${formatAIResponse(stored.snapshot)}</div>
+  </div>`;
+}
+
 const PROVIDER_CONFIG = {
   gemini: {
     label: 'Google Gemini',
@@ -4266,15 +4329,38 @@ async function useDriveVideoForAnalysis(ad) {
 // Modal "Full Video Analysis" delegates to the same deep prompt the lab uses,
 // so the per-ad report style is identical wherever the user invokes it. No
 // rank context (the user is opening one ad in isolation, not a top/bottom 5).
-function buildVideoAnalysisPrompt(ad) {
-  return buildDeepAnalysisPrompt(ad, null);
+function buildVideoAnalysisPrompt(ad, pastWinners) {
+  return buildDeepAnalysisPrompt(ad, null, pastWinners);
+}
+
+// Renders a "Past winners' patterns" block to slot above the Verdict heading.
+// When the analysis-history feature is configured, the dashboard fetches the
+// 3 most recent score≥4 analyses and feeds their snapshots in as priors.
+// Gemini compares the current ad against these patterns instead of judging
+// in a vacuum — that's the "train on past data points" loop.
+function formatPastWinnersForPrompt(winners) {
+  if (!Array.isArray(winners) || !winners.length) return '';
+  const lines = ['', '## Past winners\' patterns (recent score≥4 from this account)'];
+  winners.forEach((w, i) => {
+    const m = w.metrics || {};
+    const fmt = (v, suffix='') => (v == null || isNaN(v)) ? '—' : Number(v).toFixed(1) + suffix;
+    const fmtR = (v) => (v == null || isNaN(v)) ? '—' : '₹' + Math.round(v);
+    lines.push(`\n**Winner ${i+1} — ${w.ad_name || 'unnamed'}** · CPI ${fmtR(m.cpi)} · Hook ${fmt(m.hook,'%')} · Hold ${fmt(m.hold,'%')} · CTI ${fmt(m.cti,'%')}`);
+    // Pull just the Snapshot section out of the winner's stored snapshot — the
+    // full report would balloon the prompt and dilute the signal.
+    const snap = String(w.snapshot || '');
+    const snapMatch = snap.match(/##\s*Snapshot[\s\S]*?(?=\n##\s|$)/i);
+    if (snapMatch) lines.push(snapMatch[0].trim());
+  });
+  lines.push('\nUse these as reference. When analyzing the current ad, call out where it mirrors or diverges from these patterns — but stay grounded in what YOU see in THIS video.');
+  return lines.join('\n');
 }
 
 // "Generate Variations" prompt — anchored on observed insights from THIS
 // video. Variation 1 must be a fresh-script concept (new story, same formula).
 // Variations 2 and 3 cover cut/edit and CTA so the editor has a spread of
 // directions to pitch. All three reference observed details from the video.
-function buildVariationsPrompt(ad) {
+function buildVariationsPrompt(ad, pastWinners) {
   const m = ad.metrics;
   const e = ad.extra || {};
   const fmt = (v, suffix='') => isNaN(v) ? '—' : v.toFixed(1) + suffix;
@@ -4290,7 +4376,7 @@ Rules:
 - Stay under 400 words total.
 
 CONTEXT: This ad's performance — CPI ${fmtR(m.cpi)} · Hook ${fmt(m.hook,'%')} · Hold ${fmt(m.hold,'%')} · CTI ${fmt(m.cti,'%')} · CPM ${fmtR(m.cpm)} · Installs ${e.installs || 0} · Spend ${fmtR(ad.spend)}.
-
+${formatPastWinnersForPrompt(pastWinners)}
 ## Snapshot (one observation per dimension)
 - **Hook (0:00-0:03):** what happens on screen + the craft choice driving it. [Hook]
 - **Hold (mid):** pacing, beat shape, where attention dips or spikes. [Hold]
@@ -4529,9 +4615,15 @@ async function analyzeVideo(file) {
   document.getElementById('aiResultArea').innerHTML = '';
 
   try {
+    // Kick off winners fetch + upload in parallel — both finish before we
+    // call generateContent, and the network round-trips overlap.
+    const winnersPromise = fetchPastWinners();
     const videoFileData = await uploadVideoToGemini(file);
+    const pastWinners   = await winnersPromise;
 
-    const prompt = mode === 'variations' ? buildVariationsPrompt(ad) : buildVideoAnalysisPrompt(ad);
+    const prompt = mode === 'variations'
+      ? buildVariationsPrompt(ad, pastWinners)
+      : buildVideoAnalysisPrompt(ad, pastWinners);
 
     document.getElementById('videoProgressLabel').textContent = mode === 'variations'
       ? 'Gemini is watching your video to draft variations…'
@@ -4540,12 +4632,16 @@ async function analyzeVideo(file) {
 
     const formattedHTML = `<div class="ai-result" style="border-color:rgba(240,223,32,.3); background:linear-gradient(135deg, rgba(240,223,32,.06), rgba(240,160,48,.06));">
       <h4 style="color:var(--accent);">${headLabel}</h4>
-      <div style="font-size:10px; color:var(--text-dim); margin-bottom:10px;">Analyzed: ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)</div>
+      <div style="font-size:10px; color:var(--text-dim); margin-bottom:10px;">Analyzed: ${file.name} (${(file.size/1024/1024).toFixed(1)} MB)${pastWinners.length ? ` · ${pastWinners.length} past winner${pastWinners.length>1?'s':''} referenced` : ''}</div>
       <div class="ai-result-content">${formatAIResponse(responseText)}</div>
     </div>`;
 
     document.getElementById('aiResultArea').innerHTML = formattedHTML;
     aiCache[cacheKey] = formattedHTML;
+    // Persist for future opens and future "past winners" lookups. Fire and
+    // forget — the user already has their result.
+    saveAnalysisToHistory(ad, mode, responseText);
+    _storedAnalysisProbed.add(ad.id + ':' + mode); // suppress redundant load on next open
 
   } catch (err) {
     document.getElementById('aiResultArea').innerHTML = `<div class="ai-result" style="border-color:var(--red);"><h4 style="color:var(--red);">${mode === 'variations' ? 'Variations Failed' : 'Video Analysis Failed'}</h4><div class="ai-result-content">${err.message}<br><br>Tips: Use MP4 format, keep under 100MB, ensure video is under 2 minutes. Check your Gemini API key at <a href="https://aistudio.google.com" target="_blank" style="color:var(--blue);">aistudio.google.com</a></div></div>`;
@@ -4643,6 +4739,24 @@ openModal = function(id) {
     resultArea.innerHTML = aiCache[cacheKeyVideo];
   } else if (aiCache[cacheKeyThumb]) {
     resultArea.innerHTML = aiCache[cacheKeyThumb];
+  } else if (BACKEND.analysisHistoryEnabled) {
+    // No in-memory cache — try server-stored history. Survives reload, so
+    // a re-opened ad shows its prior analysis instantly without burning
+    // another Gemini analysis.
+    const adObj = allAds.find(a => a.id === id);
+    if (adObj && adObj.adId && !_storedAnalysisProbed.has(id + ':_video')) {
+      fetchStoredAnalysis(adObj.adId).then(stored => {
+        _storedAnalysisProbed.add(id + ':_video');
+        // Only render if the user is still looking at this ad and hasn't
+        // started a fresh analysis in the meantime.
+        if (currentModalAdId !== id) return;
+        if (aiCache[cacheKeyVideo] || aiCache[cacheKeyThumb]) return;
+        if (!stored) return;
+        const html = renderStoredAnalysisIntoModal(stored, 'video');
+        resultArea.innerHTML = html;
+        aiCache[cacheKeyVideo] = html;
+      });
+    }
   }
 
   // Update button states for the two AI buttons in the modal.
