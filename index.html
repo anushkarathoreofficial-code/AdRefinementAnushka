@@ -587,6 +587,28 @@
 </head>
 <body>
 
+<!-- Auth gate — server requires DASHBOARD_PASSWORD; this blocks the dashboard
+     until the cookie is set. Hidden by default; the bootstrap shows it. -->
+<div id="authGate" style="display:none; position:fixed; inset:0; z-index:9999;
+     background:#000; align-items:center; justify-content:center; padding:24px;">
+  <form id="authForm" style="background:#111; border:1px solid #2a2a2a; border-radius:12px;
+       padding:28px 32px; width:100%; max-width:380px; box-sizing:border-box;">
+    <h2 style="margin:0 0 6px; color:#fff; font-size:18px; letter-spacing:.2px;">Sign in</h2>
+    <p style="margin:0 0 18px; color:#999; font-size:13px;">
+      This dashboard is private. Enter the access password to continue.
+    </p>
+    <input id="authPassword" type="password" autocomplete="current-password" required
+           placeholder="Password"
+           style="width:100%; box-sizing:border-box; background:#1a1a1a; border:1px solid #2a2a2a;
+                  border-radius:8px; padding:10px 12px; color:#fff; font-size:14px; outline:none;">
+    <div id="authError" style="margin-top:10px; min-height:18px; color:#ff6b6b; font-size:13px;"></div>
+    <button id="authSubmit" type="submit"
+            style="margin-top:14px; width:100%; background:#f0df20; color:#000; border:0;
+                   border-radius:8px; padding:10px 14px; font-weight:600; font-size:14px;
+                   cursor:pointer;">Sign in</button>
+  </form>
+</div>
+
 <div class="header">
   <h1><span>Astrotalk</span> Ad Refinement Dashboard</h1>
   <div class="header-right">
@@ -5188,8 +5210,70 @@ renderAll = function() {
   renderWorkflow();
 };
 
+// ============ AUTH GATE ============
+// The server requires a signed cookie for /config.json and /api/*. If the
+// browser doesn't have one yet, show the login modal and block boot until
+// the password is accepted. On success we reload so the rest of the app
+// starts cleanly with the cookie in place.
+async function _ensureAuthenticated() {
+  let status;
+  try {
+    const r = await fetch('/api/auth-status', { credentials: 'same-origin', cache: 'no-store' });
+    status = await r.json();
+  } catch (e) {
+    // Server unreachable — let the normal load path show the standard error.
+    return true;
+  }
+  if (!status || status.required === false || status.authenticated) return true;
+
+  return new Promise((resolve) => {
+    const gate    = document.getElementById('authGate');
+    const form    = document.getElementById('authForm');
+    const input   = document.getElementById('authPassword');
+    const errEl   = document.getElementById('authError');
+    const submit  = document.getElementById('authSubmit');
+    if (!gate || !form) return resolve(true); // shouldn't happen
+    gate.style.display = 'flex';
+    setTimeout(() => input && input.focus(), 0);
+
+    form.addEventListener('submit', async (ev) => {
+      ev.preventDefault();
+      errEl.textContent = '';
+      submit.disabled = true;
+      submit.textContent = 'Signing in…';
+      try {
+        const r = await fetch('/api/login', {
+          method: 'POST',
+          credentials: 'same-origin',
+          cache: 'no-store',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ password: input.value })
+        });
+        if (r.ok) {
+          // Reload — the dashboard re-bootstraps with the cookie present and
+          // every /config.json + /api/* request will succeed.
+          window.location.reload();
+          return;
+        }
+        let msg = 'Sign-in failed.';
+        try { const j = await r.json(); if (j && j.error) msg = j.error; } catch {}
+        errEl.textContent = msg;
+      } catch (e) {
+        errEl.textContent = 'Network error. Try again.';
+      } finally {
+        submit.disabled = false;
+        submit.textContent = 'Sign in';
+      }
+    });
+    // We never resolve(true) here — the page reloads on success and the
+    // failure path keeps the modal up. This keeps the rest of boot blocked.
+  });
+}
+
 // Call on page load
 async function _bootDashboard() {
+  const ok = await _ensureAuthenticated();
+  if (!ok) return;
   initCollaboration();
   await _loadRuntimeConfig();
   await loadFromBackend();

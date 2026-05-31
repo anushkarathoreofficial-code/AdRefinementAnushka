@@ -2,7 +2,11 @@
  * Tiny Express server for Railway (or any Node host).
  *
  * Env vars:
- *   META_CSV_URL       — (legacy) published Google Sheet CSV for Meta ads data
+ *   DASHBOARD_PASSWORD — required in production. Shared secret that gates
+ *                        every data endpoint (/config.json, /api/*).
+ *                        If unset, the server runs in OPEN mode and prints
+ *                        a warning. Never deploy without it.
+ *   META_CSV_URL       — (legacy) published Google Sheet CSV for Meta ads
  *   LINKS_CSV_URL      — published Google Sheet CSV for ad-name → Drive link
  *   DRIVE_API_KEY      — Google Drive API key (used for folder resolution)
  *   META_TOKEN         — Meta Marketing API long-lived access token
@@ -10,19 +14,181 @@
  *   META_DATE_PRESET   — optional, defaults to "last_7d"
  *   META_CAMPAIGN_IDS  — optional, comma-separated campaign ids to limit to
  *
- * If META_TOKEN + META_AD_ACCOUNT are set, the dashboard pulls ad metrics
- * live from the Meta Graph API via /api/meta-insights.csv. Otherwise it
- * falls back to META_CSV_URL (the Google Sheets pipeline).
+ * Security model:
+ *   - The Meta token never leaves the server. The browser only sees the
+ *     proxy path (/api/meta-insights.csv).
+ *   - All data endpoints require a signed auth cookie. The cookie is set
+ *     by POST /api/login after a constant-time password check.
+ *   - Static file serving is locked down to index.html only (no source
+ *     code, env example, package.json, or apps-script files leak).
  */
 
 const express = require('express');
 const path = require('path');
+const crypto = require('crypto');
 
 const app = express();
+// Railway terminates TLS at the edge; honour X-Forwarded-* so req.ip is real
+// (rate limiter relies on it) and req.secure works for the Secure cookie flag.
+app.set('trust proxy', true);
+app.disable('x-powered-by');
 
-// ---------- Runtime config for the browser ----------
-// Exposed at /config.json. The token is NEVER sent to the client — only the
-// path of the proxy endpoint that uses it server-side.
+// ---------------- CONFIG ----------------
+const DASHBOARD_PASSWORD = process.env.DASHBOARD_PASSWORD || '';
+const AUTH_COOKIE_NAME = 'dashauth';
+const AUTH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+if (!DASHBOARD_PASSWORD) {
+  console.warn(
+    '\n  ⚠  DASHBOARD_PASSWORD is not set — running in OPEN mode.\n' +
+    '     All data endpoints are publicly reachable. Set DASHBOARD_PASSWORD\n' +
+    '     in Railway → Variables before exposing this deployment.\n'
+  );
+} else if (DASHBOARD_PASSWORD.length < 12) {
+  console.warn(
+    '\n  ⚠  DASHBOARD_PASSWORD is shorter than 12 characters. Pick a longer\n' +
+    '     value — this is the only barrier between the public internet and\n' +
+    '     your Meta ad data.\n'
+  );
+}
+
+// ---------------- SECURITY HEADERS ----------------
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  res.set('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  next();
+});
+
+// Small JSON body limit — only /api/login uses a body.
+app.use(express.json({ limit: '1kb' }));
+
+// ---------------- AUTH HELPERS ----------------
+function safeEq(a, b) {
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  // crypto.timingSafeEqual requires equal-length buffers; pad-compare against
+  // a same-length buffer so timing doesn't depend on which input was shorter.
+  if (ab.length !== bb.length) {
+    crypto.timingSafeEqual(ab, ab);
+    return false;
+  }
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function makeAuthCookie() {
+  const ts = String(Date.now());
+  const sig = crypto.createHmac('sha256', DASHBOARD_PASSWORD).update(ts).digest('hex');
+  return `${ts}.${sig}`;
+}
+
+function verifyAuthCookie(value) {
+  if (!DASHBOARD_PASSWORD) return false;
+  if (!value || typeof value !== 'string') return false;
+  const dot = value.indexOf('.');
+  if (dot <= 0) return false;
+  const ts = value.slice(0, dot);
+  const sig = value.slice(dot + 1);
+  if (!/^\d+$/.test(ts) || !/^[a-f0-9]+$/i.test(sig)) return false;
+  const expected = crypto.createHmac('sha256', DASHBOARD_PASSWORD).update(ts).digest('hex');
+  if (!safeEq(sig, expected)) return false;
+  const age = Date.now() - parseInt(ts, 10);
+  return age >= 0 && age <= AUTH_COOKIE_MAX_AGE_MS;
+}
+
+function readCookie(req, name) {
+  const header = req.headers.cookie || '';
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(eq + 1).trim()); }
+    catch { return ''; }
+  }
+  return '';
+}
+
+function setAuthCookie(req, res, value) {
+  const flags = [
+    `${AUTH_COOKIE_NAME}=${encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Strict',
+    `Max-Age=${Math.floor(AUTH_COOKIE_MAX_AGE_MS / 1000)}`
+  ];
+  if (req.secure || req.headers['x-forwarded-proto'] === 'https') flags.push('Secure');
+  res.set('Set-Cookie', flags.join('; '));
+}
+
+// ---------------- LOGIN RATE LIMITING ----------------
+const loginAttempts = new Map();
+const LOGIN_WINDOW_MS = 60 * 1000;
+const LOGIN_MAX = 5;
+
+function loginAllowed(req) {
+  const ip = String(req.ip || 'unknown');
+  const now = Date.now();
+  const recent = (loginAttempts.get(ip) || []).filter(t => now - t < LOGIN_WINDOW_MS);
+  recent.push(now);
+  loginAttempts.set(ip, recent);
+  return recent.length <= LOGIN_MAX;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, arr] of loginAttempts) {
+    const fresh = arr.filter(t => now - t < LOGIN_WINDOW_MS);
+    if (fresh.length === 0) loginAttempts.delete(ip);
+    else loginAttempts.set(ip, fresh);
+  }
+}, 5 * 60 * 1000).unref();
+
+// ---------------- PUBLIC AUTH ENDPOINTS ----------------
+app.get('/api/auth-status', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!DASHBOARD_PASSWORD) return res.json({ required: false, authenticated: true });
+  res.json({
+    required: true,
+    authenticated: verifyAuthCookie(readCookie(req, AUTH_COOKIE_NAME))
+  });
+});
+
+app.post('/api/login', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!DASHBOARD_PASSWORD) {
+    return res.status(503).json({ error: 'login disabled (DASHBOARD_PASSWORD not set)' });
+  }
+  if (!loginAllowed(req)) {
+    return res.status(429).json({ error: 'Too many attempts. Try again in a minute.' });
+  }
+  const password = (req.body && typeof req.body.password === 'string') ? req.body.password : '';
+  if (!safeEq(password, DASHBOARD_PASSWORD)) {
+    return res.status(401).json({ error: 'Invalid password.' });
+  }
+  setAuthCookie(req, res, makeAuthCookie());
+  res.json({ ok: true });
+});
+
+app.post('/api/logout', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.set('Set-Cookie', `${AUTH_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0`);
+  res.json({ ok: true });
+});
+
+// ---------------- AUTH GATE (everything below requires login) ----------------
+function requireAuth(req, res, next) {
+  if (!DASHBOARD_PASSWORD) return next(); // OPEN mode, warned at boot
+  if (verifyAuthCookie(readCookie(req, AUTH_COOKIE_NAME))) return next();
+  res.set('Cache-Control', 'no-store');
+  res.status(401).json({ error: 'auth required' });
+}
+
+app.use('/config.json', requireAuth);
+app.use('/api', requireAuth);
+
+// ---------------- /config.json (browser runtime config) ----------------
 app.get('/config.json', (req, res) => {
   const hasMetaApi = !!(process.env.META_TOKEN && process.env.META_AD_ACCOUNT);
   res.set('Cache-Control', 'no-store');
@@ -30,21 +196,18 @@ app.get('/config.json', (req, res) => {
     metaCsvUrl:  process.env.META_CSV_URL  || '',
     linksCsvUrl: process.env.LINKS_CSV_URL || '',
     driveApiKey: process.env.DRIVE_API_KEY || '',
-    // When set, the dashboard pulls live from Meta API instead of the CSV.
     metaApiUrl:  hasMetaApi ? '/api/meta-insights.csv' : ''
   });
 });
 
-// ---------- Meta API: connection test ----------
-// Mirrors the starter snippet you were given. Hit /api/ad-metrics to confirm
-// the token + account ID combination works. Returns raw Graph API JSON.
+// ---------------- Meta API: connection test ----------------
 app.get('/api/ad-metrics', async (req, res) => {
   const token = process.env.META_TOKEN;
   const account = process.env.META_AD_ACCOUNT;
   if (!token || !account) {
     return res.status(503).json({ error: 'Set META_TOKEN and META_AD_ACCOUNT env vars.' });
   }
-  const datePreset = req.query.date_preset || process.env.META_DATE_PRESET || 'last_7d';
+  const datePreset = sanitizeDatePreset(req.query.date_preset || process.env.META_DATE_PRESET);
   const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(account)}/insights` +
               `?fields=spend,impressions,clicks,ctr` +
               `&date_preset=${encodeURIComponent(datePreset)}` +
@@ -53,16 +216,15 @@ app.get('/api/ad-metrics', async (req, res) => {
     const r = await fetch(url);
     const data = await r.json();
     res.set('Cache-Control', 'no-store');
+    // Forward the Graph response verbatim — it contains metrics on success
+    // and an error object on failure. Neither includes the access token.
     res.status(r.ok ? 200 : 502).json(data);
   } catch (err) {
-    res.status(502).json({ error: String(err && err.message || err) });
+    res.status(502).json({ error: 'Meta API fetch failed.' });
   }
 });
 
-// ---------- Meta API: full ad-level insights as CSV ----------
-// Emits a CSV with the columns the dashboard's parseMetaCSV() already
-// recognises. Handles pagination. Computes CPI/Hook/Hold/CTI from the
-// `actions` and `video_*_actions` arrays the Graph API returns.
+// ---------------- Meta API: full ad-level insights as CSV ----------------
 app.get('/api/meta-insights.csv', async (req, res) => {
   const token = process.env.META_TOKEN;
   const account = process.env.META_AD_ACCOUNT;
@@ -70,7 +232,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     return res.status(503).type('text/plain')
       .send('Meta API not configured: set META_TOKEN and META_AD_ACCOUNT env vars.');
   }
-  const datePreset = req.query.date_preset || process.env.META_DATE_PRESET || 'last_7d';
+  const datePreset = sanitizeDatePreset(req.query.date_preset || process.env.META_DATE_PRESET);
   const fields = [
     'ad_id','ad_name','adset_name','campaign_id','campaign_name',
     'spend','impressions','reach','frequency',
@@ -80,10 +242,9 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     'date_start','date_stop'
   ].join(',');
 
-  // Optional campaign-id filter (env var, overridable per-request).
   const campaignIdsRaw = (req.query.campaign_ids || process.env.META_CAMPAIGN_IDS || '').trim();
   const campaignIds = campaignIdsRaw
-    ? campaignIdsRaw.split(',').map(s => s.trim()).filter(Boolean)
+    ? campaignIdsRaw.split(',').map(s => s.trim()).filter(s => /^\d{1,30}$/.test(s))
     : [];
   let filteringParam = '';
   if (campaignIds.length) {
@@ -101,25 +262,42 @@ app.get('/api/meta-insights.csv', async (req, res) => {
   try {
     const rows = [];
     let nextUrl = firstUrl;
-    // Hard cap on pages just in case — 50 * 500 = 25k ads.
     for (let page = 0; nextUrl && page < 50; page++) {
       const r = await fetch(nextUrl);
       const data = await r.json();
       if (!r.ok || data.error) {
-        const msg = data.error ? `${data.error.message} (code ${data.error.code})` : `HTTP ${r.status}`;
+        const msg = data.error
+          ? `${data.error.message} (code ${data.error.code})`
+          : `HTTP ${r.status}`;
         return res.status(502).type('text/plain').send('Meta API error: ' + msg);
       }
       if (Array.isArray(data.data)) rows.push(...data.data);
+      // Meta's paging.next URL contains the access token; that's fine to
+      // re-use as-is (it never leaves the server). We do NOT log it.
       nextUrl = data.paging && data.paging.next ? data.paging.next : null;
     }
     res.set('Cache-Control', 'no-store');
     res.type('text/csv').send(buildInsightsCSV(rows));
   } catch (err) {
-    res.status(502).type('text/plain').send('Meta API fetch failed: ' + (err && err.message || err));
+    res.status(502).type('text/plain').send('Meta API fetch failed.');
   }
 });
 
-// ---------- helpers ----------
+// ---------------- Helpers ----------------
+function sanitizeDatePreset(raw) {
+  const v = String(raw || '').trim().toLowerCase();
+  // Whitelist Graph API's documented date_preset values. Anything else falls
+  // back to last_7d, so a malicious query string can't probe other endpoints.
+  const allowed = new Set([
+    'today','yesterday','this_month','last_month',
+    'this_quarter','maximum',
+    'last_3d','last_7d','last_14d','last_28d','last_30d','last_90d',
+    'last_week_mon_sun','last_week_sun_sat','last_quarter','last_year',
+    'this_week_mon_today','this_week_sun_today','this_year'
+  ]);
+  return allowed.has(v) ? v : 'last_7d';
+}
+
 function buildInsightsCSV(rows) {
   const header = [
     'Ad Name','Campaign','Campaign ID','Ad Set','Date',
@@ -190,13 +368,17 @@ function csvField(s) {
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
 }
 
-// ---------- Static files ----------
-app.use(express.static(__dirname, {
-  extensions: ['html'],
-  setHeaders(res, filePath) {
-    if (filePath.endsWith('index.html')) res.set('Cache-Control', 'no-store');
-  }
-}));
+// ---------------- Static: only the dashboard HTML ----------------
+// We do NOT use express.static(__dirname): that would expose server.js,
+// package.json, the apps-script .gs files, README, etc.
+app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'index.html'));
+});
+app.get('/index.html', (req, res) => res.redirect(301, '/'));
+
+// Final catch-all → 404 JSON. Keeps the surface area tight.
+app.use((req, res) => res.status(404).json({ error: 'not found' }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
