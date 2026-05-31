@@ -253,7 +253,7 @@ app.get('/api/ad-creative', async (req, res) => {
     const creativeFields = [
       'video_id','thumbnail_url','image_url',
       'object_story_spec{video_data{video_id,image_url}}',
-      'asset_feed_spec{videos{video_id,thumbnail_url,url},images{url}}',
+      'asset_feed_spec{videos{video_id,thumbnail_url},images{url}}',
       'effective_object_story_id'
     ].join(',');
     const adUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(adId)}` +
