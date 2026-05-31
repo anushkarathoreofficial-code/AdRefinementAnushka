@@ -2687,9 +2687,23 @@ function openModal(id) {
       resolveFolderToVideo(folderId).then(async resolvedId => {
         if (currentModalAdId !== id) return;
         if (!resolvedId) {
-          // resolveFolderToVideo returned null — could be private, empty,
-          // API key restriction, or quota. Diagnose live so the user
-          // sees the actual root cause instead of a generic message.
+          // Drive folder couldn't be opened with the public API key — usually
+          // because of a Workspace "sign-in required" sharing policy. If the
+          // ad has a Meta ad id, fall back to the Meta-hosted video instead
+          // of dead-ending on the diagnostic screen.
+          if (ad.adId) {
+            await _fetchAdCreativeIfNeeded(ad);
+            if (currentModalAdId !== id) return;
+            if (ad.metaVideo || ad.metaThumb) {
+              // Re-paint the whole preview area in Meta mode so the user
+              // also loses the Drive-specific tab buttons (Direct Stream,
+              // Download) that don't apply when the file isn't reachable.
+              renderMetaPreview(previewArea, ad);
+              return;
+            }
+          }
+          // No Meta fallback either — show the diagnostic so the user can
+          // fix the sharing setting on the folder.
           const diag = await diagnoseSpecificFolder(folderId);
           const slot2 = document.getElementById('previewSlot');
           const hint2 = document.getElementById('previewHint');
