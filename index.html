@@ -1006,6 +1006,7 @@ const BACKEND = {
 const _metaCreativeCache = new Map();
 const _metaCreativeInflight = new Map(); // ad_id → Promise (de-dupes parallel fetches)
 const _metaCreativeFailed = new Set();   // ad_id → don't retry within this session
+const _metaCreativeErrors = new Map();   // ad_id → human-readable reason for the failure
 
 // On-demand creative resolver. Returns once ad.metaVideo / ad.metaThumb are
 // populated (or stays empty on failure). Idempotent: repeated calls for the
@@ -1026,7 +1027,13 @@ async function _fetchAdCreativeIfNeeded(ad) {
     try {
       const r = await fetch('/api/ad-creative?ad_id=' + encodeURIComponent(ad.adId),
                             { credentials: 'same-origin', cache: 'no-store' });
-      if (!r.ok) { _metaCreativeFailed.add(ad.adId); return; }
+      if (!r.ok) {
+        let reason = `HTTP ${r.status}`;
+        try { const j = await r.json(); if (j && j.error) reason = j.error; } catch {}
+        _metaCreativeErrors.set(ad.adId, reason);
+        _metaCreativeFailed.add(ad.adId);
+        return;
+      }
       const data = await r.json();
       _metaCreativeCache.set(ad.adId, data);
       // Apply to every ad object with this adId — the same Meta ad can
@@ -1065,7 +1072,12 @@ function renderMetaPreview(previewArea, ad) {
       <img src="${ad.metaThumb}" alt="" style="width:100%; max-height:480px; object-fit:contain; background:#000; border-radius:8px;">
       <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Image creative — no video available from Meta for this ad.</div>`;
   } else if (_metaCreativeFailed.has(ad.adId)) {
-    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">Couldn't load this creative from the Meta API. Try refreshing — the URL signature may have expired, or the token may lack permission for this ad.</div>`;
+    const reason = _metaCreativeErrors.get(ad.adId) || '';
+    previewArea.innerHTML = `<div style="padding:24px; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">
+      <div style="margin-bottom:8px;">Couldn't load this creative from the Meta API.</div>
+      ${reason ? `<div style="font-family:monospace; font-size:11px; background:#000; color:#ff9999; padding:8px 10px; border-radius:4px; word-break:break-word;">${reason}</div>` : ''}
+      <div style="margin-top:10px; font-size:12px;">Ad ID: <span style="font-family:monospace;">${ad.adId}</span></div>
+    </div>`;
   } else {
     previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;"><div style="margin-bottom:8px; font-size:24px;">⏳</div>Loading creative from Meta…</div>`;
   }
