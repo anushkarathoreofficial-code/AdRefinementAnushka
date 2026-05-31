@@ -2,17 +2,21 @@
  * Tiny Express server for Railway (or any Node host).
  *
  * Env vars:
- *   DASHBOARD_PASSWORD — required in production. Shared secret that gates
- *                        every data endpoint (/config.json, /api/*).
- *                        If unset, the server runs in OPEN mode and prints
- *                        a warning. Never deploy without it.
- *   META_CSV_URL       — (legacy) published Google Sheet CSV for Meta ads
- *   LINKS_CSV_URL      — published Google Sheet CSV for ad-name → Drive link
- *   DRIVE_API_KEY      — Google Drive API key (used for folder resolution)
- *   META_TOKEN         — Meta Marketing API long-lived access token
- *   META_AD_ACCOUNT    — Meta ad account, e.g. "act_123456789"
- *   META_DATE_PRESET   — optional, defaults to "last_7d"
- *   META_CAMPAIGN_IDS  — optional, comma-separated campaign ids to limit to
+ *   DASHBOARD_PASSWORD       — required in production. Shared secret that gates
+ *                              every data endpoint (/config.json, /api/*).
+ *                              If unset, the server runs in OPEN mode and prints
+ *                              a warning. Never deploy without it.
+ *   META_CSV_URL             — (legacy) published Google Sheet CSV for Meta ads
+ *   LINKS_CSV_URL            — published Google Sheet CSV for ad-name → Drive link
+ *   DRIVE_API_KEY            — Google Drive API key (used for anonymous folder resolution)
+ *   GOOGLE_CREDENTIALS_JSON  — service account JSON (string). When set, the dashboard
+ *                              proxies Drive thumbnails + video bytes through the
+ *                              server using this account, which lets it serve files
+ *                              that are restricted to "sign-in required" sharing.
+ *   META_TOKEN               — Meta Marketing API long-lived access token
+ *   META_AD_ACCOUNT          — Meta ad account, e.g. "act_123456789"
+ *   META_DATE_PRESET         — optional, defaults to "last_7d"
+ *   META_CAMPAIGN_IDS        — optional, comma-separated campaign ids to limit to
  *
  * Security model:
  *   - The Meta token never leaves the server. The browser only sees the
@@ -193,11 +197,125 @@ app.get('/config.json', (req, res) => {
   const hasMetaApi = !!(process.env.META_TOKEN && process.env.META_AD_ACCOUNT);
   res.set('Cache-Control', 'no-store');
   res.json({
-    metaCsvUrl:  process.env.META_CSV_URL  || '',
-    linksCsvUrl: process.env.LINKS_CSV_URL || '',
-    driveApiKey: process.env.DRIVE_API_KEY || '',
-    metaApiUrl:  hasMetaApi ? '/api/meta-insights.csv' : ''
+    metaCsvUrl:        process.env.META_CSV_URL  || '',
+    linksCsvUrl:       process.env.LINKS_CSV_URL || '',
+    driveApiKey:       process.env.DRIVE_API_KEY || '',
+    metaApiUrl:        hasMetaApi ? '/api/meta-insights.csv' : '',
+    // When true, the dashboard routes Drive thumbnails + video playback
+    // through the server (service-account-backed) instead of hitting the
+    // public Drive endpoints. Required for files behind a "sign-in
+    // required" sharing policy.
+    driveProxyEnabled: !!process.env.GOOGLE_CREDENTIALS_JSON
   });
+});
+
+// ---------------- Drive proxy (service-account backed) ----------------
+// Used when files live in a Shared Drive whose Workspace policy enforces
+// "sign-in required" on every link share — the public Drive API key can't
+// reach them, but the service account (a Manager on the Shared Drive) can.
+// All three endpoints sit behind the same requireAuth gate as the rest of
+// /api/*, so video bytes never leak out of the signed-in dashboard.
+let _googleLib = null;
+function getGoogle() {
+  if (!_googleLib) _googleLib = require('googleapis').google;
+  return _googleLib;
+}
+function hasDriveSA() {
+  return !!process.env.GOOGLE_CREDENTIALS_JSON;
+}
+let _driveAuth = null;
+function getDriveAuth() {
+  if (_driveAuth) return _driveAuth;
+  const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS_JSON);
+  _driveAuth = new (getGoogle().auth.GoogleAuth)({
+    credentials,
+    scopes: ['https://www.googleapis.com/auth/drive.readonly']
+  });
+  return _driveAuth;
+}
+async function getDriveAccessToken() {
+  const client = await getDriveAuth().getClient();
+  const tokenResp = await client.getAccessToken();
+  return tokenResp.token;
+}
+const VALID_ID = /^[A-Za-z0-9_-]{10,}$/;
+
+// Resolve a folder id to its first video file. Returns metadata the client
+// uses to render the modal preview.
+app.get('/api/drive-resolve', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasDriveSA()) return res.status(503).json({ error: 'GOOGLE_CREDENTIALS_JSON not set' });
+  const folderId = String(req.query.folder_id || '').trim();
+  if (!VALID_ID.test(folderId)) return res.status(400).json({ error: 'invalid folder_id' });
+  try {
+    const drive = getGoogle().drive({ version: 'v3', auth: getDriveAuth() });
+    const list = await drive.files.list({
+      q: `'${folderId}' in parents and trashed = false`,
+      fields: 'files(id,name,mimeType,hasThumbnail)',
+      pageSize: 20,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true
+    });
+    const files = list.data.files || [];
+    const pick = files.find(f => (f.mimeType || '').startsWith('video/')) || files[0];
+    if (!pick) return res.status(404).json({ error: 'folder is empty' });
+    res.json({ file_id: pick.id, name: pick.name, mime_type: pick.mimeType, has_thumbnail: !!pick.hasThumbnail });
+  } catch (err) {
+    const msg = (err.errors && err.errors[0] && err.errors[0].message) || err.message || 'unknown';
+    res.status(502).json({ error: 'Drive error: ' + msg });
+  }
+});
+
+// Stream a Drive video through the server. Forwards the browser's Range
+// header so scrubbing/seeking works without buffering the whole file.
+app.get('/api/drive-stream', async (req, res) => {
+  if (!hasDriveSA()) return res.status(503).type('text/plain').send('GOOGLE_CREDENTIALS_JSON not set');
+  const fileId = String(req.query.file_id || '').trim();
+  if (!VALID_ID.test(fileId)) return res.status(400).type('text/plain').send('invalid file_id');
+  try {
+    const token = await getDriveAccessToken();
+    const headers = { Authorization: `Bearer ${token}` };
+    if (req.headers.range) headers.Range = req.headers.range;
+    const driveUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
+    const driveRes = await fetch(driveUrl, { headers });
+    res.status(driveRes.status);
+    for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
+      const v = driveRes.headers.get(h);
+      if (v) res.set(h, v);
+    }
+    res.set('Cache-Control', 'no-store');
+    if (!driveRes.body) return res.end();
+    const { Readable } = require('node:stream');
+    Readable.fromWeb(driveRes.body).pipe(res);
+  } catch (err) {
+    res.status(502).type('text/plain').send('Drive stream failed.');
+  }
+});
+
+// Thumbnail proxy. Uses drive.files.get to read the signed thumbnailLink,
+// then bumps the size param. Cached client-side for an hour.
+app.get('/api/drive-thumbnail', async (req, res) => {
+  if (!hasDriveSA()) return res.status(503).end();
+  const fileId = String(req.query.file_id || '').trim();
+  if (!VALID_ID.test(fileId)) return res.status(400).end();
+  try {
+    const drive = getGoogle().drive({ version: 'v3', auth: getDriveAuth() });
+    const meta = await drive.files.get({
+      fileId, fields: 'thumbnailLink', supportsAllDrives: true
+    });
+    const link = meta.data.thumbnailLink;
+    if (!link) return res.status(404).end();
+    const finalUrl = link.replace(/=s\d+$/, '=s400');
+    const r = await fetch(finalUrl);
+    res.status(r.status);
+    res.set('content-type', r.headers.get('content-type') || 'image/jpeg');
+    res.set('Cache-Control', 'private, max-age=3600');
+    if (!r.body) return res.end();
+    const { Readable } = require('node:stream');
+    Readable.fromWeb(r.body).pipe(res);
+  } catch (err) {
+    res.status(502).end();
+  }
 });
 
 // ---------------- Meta API: connection test ----------------

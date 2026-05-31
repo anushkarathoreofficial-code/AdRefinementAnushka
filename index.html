@@ -996,7 +996,11 @@ const BACKEND = {
   linksCsvUrl: '',
   // When the server has META_TOKEN + META_AD_ACCOUNT set, this points at the
   // Node proxy (/api/meta-insights.csv) and takes priority over metaCsvUrl.
-  metaApiUrl:  ''
+  metaApiUrl:  '',
+  // When the server has GOOGLE_CREDENTIALS_JSON set, route Drive thumbnails
+  // and video bytes through the server (service-account proxy). Lets us
+  // play files behind a "sign-in required" sharing policy.
+  driveProxyEnabled: false
 };
 
 // Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). The
@@ -1118,9 +1122,10 @@ async function _loadRuntimeConfig() {
     const res = await fetch('/config.json', { cache: 'no-store' });
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const cfg = await res.json();
-    BACKEND.metaCsvUrl  = cfg.metaCsvUrl  || '';
-    BACKEND.linksCsvUrl = cfg.linksCsvUrl || '';
-    BACKEND.metaApiUrl  = cfg.metaApiUrl  || '';
+    BACKEND.metaCsvUrl        = cfg.metaCsvUrl  || '';
+    BACKEND.linksCsvUrl       = cfg.linksCsvUrl || '';
+    BACKEND.metaApiUrl        = cfg.metaApiUrl  || '';
+    BACKEND.driveProxyEnabled = !!cfg.driveProxyEnabled;
     if (cfg.driveApiKey) _runtimeDriveApiKey = cfg.driveApiKey;
   } catch (e) {
     console.warn('Could not load /config.json — falling back to empty config:', e);
@@ -1866,7 +1871,7 @@ function renderDashboard() {
     const thumbHTML = ad.metaThumb
       ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
       : fileId
-        ? `<img class="card-thumb" src="https://drive.google.com/thumbnail?id=${fileId}&sz=w200" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
+        ? `<img class="card-thumb" src="${BACKEND.driveProxyEnabled ? '/api/drive-thumbnail?file_id=' + fileId : 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w200'}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
         : folderId
           ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
           : `<div class="card-thumb-placeholder" ${previewable ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
@@ -1916,7 +1921,7 @@ function resolveCardThumbnails() {
         const img = document.createElement('img');
         img.className = 'card-thumb';
         img.alt = '';
-        img.src = `https://drive.google.com/thumbnail?id=${fileId}&sz=w200`;
+        img.src = `${BACKEND.driveProxyEnabled ? '/api/drive-thumbnail?file_id=' + fileId : 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w200'}`;
         img.onclick = () => openModal(parseInt(adId));
         img.onerror = () => {
           // Drive thumbnail failed — restore the play-button placeholder.
@@ -2652,8 +2657,19 @@ function openModal(id) {
     const fileId = getDriveFileId(ad.link);
     const embedUrl = getPreviewUrl(ad.link);
     const directLink = getDriveDirectLink(ad.link);
-    const streamUrl = fileId ? `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t` : '';
-    const altStreamUrl = fileId ? `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t` : '';
+    // When the service-account proxy is enabled, route both stream slots
+    // through the server. The proxy supports HTTP Range requests so the
+    // browser <video> element can scrub/seek normally.
+    const streamUrl = fileId
+      ? (BACKEND.driveProxyEnabled
+          ? `/api/drive-stream?file_id=${fileId}`
+          : `https://drive.usercontent.google.com/download?id=${fileId}&export=download&authuser=0&confirm=t`)
+      : '';
+    const altStreamUrl = fileId
+      ? (BACKEND.driveProxyEnabled
+          ? `/api/drive-stream?file_id=${fileId}`
+          : `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`)
+      : '';
 
     previewArea.innerHTML = `
       <div id="previewTabs" style="display:flex; gap:4px; margin-bottom:8px; flex-wrap:wrap;">
@@ -2713,8 +2729,12 @@ function openModal(id) {
         }
         const newEmbedUrl   = `https://drive.google.com/file/d/${resolvedId}/preview`;
         const newDirectLink = `https://drive.google.com/file/d/${resolvedId}/view`;
-        const newStreamUrl  = `https://drive.usercontent.google.com/download?id=${resolvedId}&export=download&authuser=0&confirm=t`;
-        const newAltStream  = `https://drive.google.com/uc?export=download&id=${resolvedId}&confirm=t`;
+        const newStreamUrl  = BACKEND.driveProxyEnabled
+          ? `/api/drive-stream?file_id=${resolvedId}`
+          : `https://drive.usercontent.google.com/download?id=${resolvedId}&export=download&authuser=0&confirm=t`;
+        const newAltStream  = BACKEND.driveProxyEnabled
+          ? `/api/drive-stream?file_id=${resolvedId}`
+          : `https://drive.google.com/uc?export=download&id=${resolvedId}&confirm=t`;
         window._previewState = { embedUrl: newEmbedUrl, streamUrl: newStreamUrl, altStreamUrl: newAltStream, directLink: newDirectLink, fileId: resolvedId };
 
         // Re-render the tab bar so Direct Stream + Download buttons show up.
@@ -3835,6 +3855,24 @@ function retryFolderInModal(folderId) {
 async function resolveFolderToVideo(folderId) {
   if (!folderId) return null;
   if (_folderResolveCache[folderId]) return _folderResolveCache[folderId];
+
+  // Prefer the server-side proxy when the service account is configured —
+  // it bypasses the "sign-in required" Workspace policy that 404s the
+  // anonymous Drive API key for restricted Shared Drive files.
+  if (BACKEND.driveProxyEnabled) {
+    try {
+      const r = await fetch('/api/drive-resolve?folder_id=' + encodeURIComponent(folderId),
+                            { credentials: 'same-origin', cache: 'no-store' });
+      if (r.ok) {
+        const data = await r.json();
+        if (data && data.file_id) {
+          _folderResolveCache[folderId] = data.file_id;
+          return data.file_id;
+        }
+      }
+    } catch (_) { /* fall through to anonymous path */ }
+  }
+
   const apiKey = getDriveApiKey();
   if (!apiKey) return null;
   try {
