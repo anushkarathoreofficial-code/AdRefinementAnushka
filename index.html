@@ -4271,40 +4271,50 @@ function buildVariationsPrompt(ad) {
   const e = ad.extra || {};
   const fmt = (v, suffix='') => isNaN(v) ? '—' : v.toFixed(1) + suffix;
   const fmtR = (v) => isNaN(v) ? '—' : '₹' + Math.round(v);
-  return `You are a senior creative strategist for Astrotalk (Vedic astrology / love & psychic consultation app — originally India, scaling US/UK/EU). Watch the full video. Then output 3 variations the editor should produce next, each anchored on what's making THIS specific ad work.
+  return `You are a top performance + creative director at Astrotalk (Vedic astrology / love & psychic consultation app — India, scaling US/UK/EU). You've just watched the full ad. Anchor a snapshot of why THIS ad works on observed craft, then spec 3 variations the editor should produce next.
 
 Rules:
-- Ground every variation in observed details from this video (timestamps, exact lines, visuals).
-- Each variation must include exact script lines (in quotes), specific edit instructions, or specific overlay text — not generic advice.
-- No preamble. Use the headings exactly as below.
+- Be OBSERVATIONAL. Every snapshot bullet needs a timestamp + a specific craft choice.
+- Every variation must reference an observation from the Snapshot ("Insight it leverages: …").
+- Variations must include exact script lines (in quotes), specific edit instructions, or specific overlay text — never generic advice.
+- Tag each insight with the metric it affects: [Hook] [Hold] [CTI] [CPI] [Brand].
+- Use the headings exactly as below. No preamble. No closing summary.
+- Stay under 400 words total.
 
 CONTEXT: This ad's performance — CPI ${fmtR(m.cpi)} · Hook ${fmt(m.hook,'%')} · Hold ${fmt(m.hold,'%')} · CTI ${fmt(m.cti,'%')} · CPM ${fmtR(m.cpm)} · Installs ${e.installs || 0} · Spend ${fmtR(ad.spend)}.
 
-## Why this ad works
-3-5 specific insights from this video, each tagged with the metric it likely lifts ([Hook] [Hold] [CTI] [CPI]). Cite timestamps. Be observational — name the craft choice, e.g. "0:02-0:04: half-beat pause before the reveal earns curiosity [Hook]". These insights are the foundation for the 3 variations below.
+## Snapshot (one observation per dimension)
+- **Hook (0:00-0:03):** what happens on screen + the craft choice driving it. [Hook]
+- **Hold (mid):** pacing, beat shape, where attention dips or spikes. [Hold]
+- **Script:** premise in one line + the strongest line in quotes with its timestamp.
+- **Visuals:** framing, cut density, b-roll quality, on-screen text.
+- **Voice modulation:** pitch / pause / emphasis pattern — quote one moment that nails it.
+- **Sound effects / music:** specific cues that lift or drag, with timestamps.
+- **Topic / pain point:** the exact life situation it taps.
+- **Relatability:** the specific cohort it lands with.
 
-## Variation 1 — Similar-script (new story, same formula)
-A fresh creative concept that takes the working insights above and applies them to a DIFFERENT story / protagonist / scenario. Same emotional formula, same beat shape — different specifics.
-- **Premise:** 1-2 lines of story setup.
+## Variation 1 — Fresh script (new story, same formula)
+Take the working craft choices from the Snapshot and apply them to a DIFFERENT story / protagonist / scenario. Same emotional formula, same beat shape — different specifics.
+- **Premise:** 1-2 lines.
 - **Hook line (0:00-0:02):** exact line in quotes.
-- **Beat structure:** 3-4 numbered beats with approximate timestamps.
+- **Beat structure:** 3-4 numbered beats with timestamps.
 - **Closing line / CTA (last 3s):** exact line in quotes.
-- **Insight it leverages:** which observation from "Why this ad works" it's reusing.
+- **Insight it leverages:** which Snapshot observation it reuses.
 - **Hypothesis:** which metric it should move and why.
 
-## Variation 2 — Cut / edit variation (same footage, different shape)
-Re-edit of the existing footage to push a specific metric higher.
-- **What to change:** specific in/out points, new b-roll inserts, pacing changes, captions. Reference exact timestamps from the original.
-- **What stays:** the working choice from the original to preserve.
-- **Hypothesis:** the metric this should move and why.
-
-## Variation 3 — CTA / end-card variation (same body, different ask)
-- **New end card (last 3s):** specific overlay text, brand element, urgency cue, proof element (screen recording, app badge, "first chat free", compliance disclaimer for foreign markets).
-- **CTA voice line if any:** exact line in quotes.
-- **What's different about the ask:** how the perceived offer changes versus the original.
+## Variation 2 — Cut / edit (same footage, different shape)
+Re-edit of the existing footage to push a specific metric.
+- **What to change:** specific in/out points, b-roll inserts, pacing, captions — reference original timestamps.
+- **What stays:** the working choice to preserve.
+- **Insight it leverages:** which Snapshot observation.
 - **Hypothesis:** metric + why.
 
-Keep total under 400 words.`;
+## Variation 3 — CTA / end-card (same body, different ask)
+- **New end card (last 3s):** specific overlay text, brand element, urgency cue, proof element.
+- **CTA voice line:** exact line in quotes.
+- **What's different about the ask:** how the perceived offer changes.
+- **Insight it leverages:** which Snapshot observation.
+- **Hypothesis:** metric + why.`;
 }
 
 // Upload video to Gemini File API using resumable upload
