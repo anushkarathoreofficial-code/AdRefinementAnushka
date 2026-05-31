@@ -999,45 +999,104 @@ const BACKEND = {
   metaApiUrl:  ''
 };
 
-// Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). Keeps
-// the dashboard from hitting /api/ad-creative again on every auto-refresh —
-// the server already caches for ~50min, so a session-long cache is safe.
+// Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). The
+// server already caches for ~50min; this session cache lets a re-parse of
+// the CSV (e.g. on auto-refresh) reuse what we already know without another
+// round-trip.
 const _metaCreativeCache = new Map();
-let _metaCreativeFetchInflight = false;
+const _metaCreativeInflight = new Map(); // ad_id → Promise (de-dupes parallel fetches)
+const _metaCreativeFailed = new Set();   // ad_id → don't retry within this session
 
-// Lazily resolve Meta video URLs + thumbnails for ads that don't already
-// have a Drive link. Re-renders affected cards as each one comes back.
-async function enrichAdsWithMetaCreatives() {
-  if (_metaCreativeFetchInflight) return;
-  if (!BACKEND.metaApiUrl) return; // only meaningful when Meta API is the source
-  const targets = allAds.filter(a => a.adId && !a.link && !a.metaVideo && !a.metaThumb);
-  if (!targets.length) return;
-  _metaCreativeFetchInflight = true;
-  try {
-    // Run with bounded concurrency so we don't fan out 200 requests at once.
-    const queue = [...targets];
-    const workers = Array.from({ length: 4 }, async () => {
-      while (queue.length) {
-        const ad = queue.shift();
-        try {
-          const r = await fetch('/api/ad-creative?ad_id=' + encodeURIComponent(ad.adId),
-                                { credentials: 'same-origin', cache: 'no-store' });
-          if (!r.ok) continue;
-          const data = await r.json();
-          _metaCreativeCache.set(ad.adId, data);
-          ad.metaVideo = data.video_url || '';
-          ad.metaThumb = data.thumbnail_url || data.image_url || '';
-        } catch (e) {
-          // Silent: a single ad failing to resolve shouldn't block the rest.
+// On-demand creative resolver. Returns once ad.metaVideo / ad.metaThumb are
+// populated (or stays empty on failure). Idempotent: repeated calls for the
+// same ad while a fetch is in flight share the same promise.
+async function _fetchAdCreativeIfNeeded(ad) {
+  if (!ad || !ad.adId) return;
+  if (ad.metaVideo || ad.metaThumb) return;
+  if (_metaCreativeFailed.has(ad.adId)) return;
+  const cached = _metaCreativeCache.get(ad.adId);
+  if (cached) {
+    ad.metaVideo = cached.video_url || '';
+    ad.metaThumb = cached.thumbnail_url || cached.image_url || '';
+    return;
+  }
+  if (_metaCreativeInflight.has(ad.adId)) return _metaCreativeInflight.get(ad.adId);
+
+  const p = (async () => {
+    try {
+      const r = await fetch('/api/ad-creative?ad_id=' + encodeURIComponent(ad.adId),
+                            { credentials: 'same-origin', cache: 'no-store' });
+      if (!r.ok) { _metaCreativeFailed.add(ad.adId); return; }
+      const data = await r.json();
+      _metaCreativeCache.set(ad.adId, data);
+      // Apply to every ad object with this adId — the same Meta ad can
+      // appear multiple times if the CSV has per-day breakdowns later.
+      for (const a of allAds) {
+        if (a.adId === ad.adId) {
+          a.metaVideo = data.video_url || '';
+          a.metaThumb = data.thumbnail_url || data.image_url || '';
         }
       }
-    });
-    await Promise.all(workers);
-    // One bulk re-render at the end is cheaper than rerendering per card.
-    if (typeof renderAll === 'function') renderAll();
-  } finally {
-    _metaCreativeFetchInflight = false;
+    } catch (e) {
+      _metaCreativeFailed.add(ad.adId);
+    } finally {
+      _metaCreativeInflight.delete(ad.adId);
+    }
+  })();
+  _metaCreativeInflight.set(ad.adId, p);
+  return p;
+}
+
+// Renders the Meta-creative preview into the modal's preview area.
+// Used both for the immediate paint (with a loading state when nothing is
+// cached yet) and the re-render once the fetch resolves.
+function renderMetaPreview(previewArea, ad) {
+  if (!previewArea) return;
+  if (ad.metaVideo) {
+    previewArea.innerHTML = `
+      <video controls playsinline preload="metadata" ${ad.metaThumb ? `poster="${ad.metaThumb}"` : ''}
+             style="width:100%; max-height:480px; background:#000; border-radius:8px;">
+        <source src="${ad.metaVideo}" type="video/mp4">
+        Your browser does not support inline video playback.
+      </video>
+      <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Preview served directly from the Meta Marketing API. Signed URL refreshes hourly.</div>`;
+  } else if (ad.metaThumb) {
+    previewArea.innerHTML = `
+      <img src="${ad.metaThumb}" alt="" style="width:100%; max-height:480px; object-fit:contain; background:#000; border-radius:8px;">
+      <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Image creative — no video available from Meta for this ad.</div>`;
+  } else if (_metaCreativeFailed.has(ad.adId)) {
+    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">Couldn't load this creative from the Meta API. Try refreshing — the URL signature may have expired, or the token may lack permission for this ad.</div>`;
+  } else {
+    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;"><div style="margin-bottom:8px; font-size:24px;">⏳</div>Loading creative from Meta…</div>`;
   }
+}
+
+// IntersectionObserver: only resolve creatives for cards that scroll into
+// view. Re-renders the affected card so the thumbnail swaps in once Meta
+// answers. Survives one card across multiple renderDashboard() passes.
+let _cardCreativeObserver = null;
+function attachCardCreativeObserver() {
+  if (!('IntersectionObserver' in window)) return;
+  if (_cardCreativeObserver) _cardCreativeObserver.disconnect();
+  _cardCreativeObserver = new IntersectionObserver((entries, obs) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting) continue;
+      const el = entry.target;
+      const adId = +el.getAttribute('data-ad-id');
+      const ad = allAds.find(a => a.id === adId);
+      if (!ad || !ad.adId || ad.link) { obs.unobserve(el); continue; }
+      if (ad.metaVideo || ad.metaThumb) { obs.unobserve(el); continue; }
+      obs.unobserve(el);
+      _fetchAdCreativeIfNeeded(ad).then(() => {
+        if (ad.metaVideo || ad.metaThumb) {
+          // One card re-rendered ≪ full re-render, but renderDashboard is
+          // cheap (~ms for hundreds of cards) and keeps state consistent.
+          if (typeof renderDashboard === 'function') renderDashboard();
+        }
+      });
+    }
+  }, { rootMargin: '200px' });
+  document.querySelectorAll('.card[data-ad-id]').forEach(el => _cardCreativeObserver.observe(el));
 }
 
 async function _loadRuntimeConfig() {
@@ -1650,10 +1709,10 @@ async function loadFromBackend() {
 
     launchDashboard();
     updateDataSourceBadge();
-    // Kick off Meta creative resolution in the background — the dashboard
-    // already showed everything it could from the CSV; previews fill in
-    // as the /api/ad-creative calls land.
-    enrichAdsWithMetaCreatives();
+    // Creative previews are now resolved lazily — only ads that scroll into
+    // view or that the user clicks "Preview" on hit /api/ad-creative. That
+    // keeps the initial render instant regardless of ad count and stays
+    // well under Meta's 200-calls-per-hour rate cap.
   } catch (err) {
     setLoadingState('error', (err && err.message) || 'Unknown error fetching data.');
   }
@@ -1806,6 +1865,7 @@ function renderDashboard() {
 
   updateCompareBar();
   resolveCardThumbnails();
+  attachCardCreativeObserver();
 }
 
 // Lazy-resolve thumbnails for cards whose link is a Drive folder URL.
@@ -2625,24 +2685,17 @@ function openModal(id) {
         switchPreviewMode('iframe');
       });
     }
-  } else if (ad.metaVideo || ad.metaThumb) {
-    // Creative resolved from the Meta API — render with a plain <video>
-    // (or just the thumbnail when no playable URL came back, e.g. image ads).
-    if (ad.metaVideo) {
-      previewArea.innerHTML = `
-        <video controls playsinline preload="metadata" ${ad.metaThumb ? `poster="${ad.metaThumb}"` : ''}
-               style="width:100%; max-height:480px; background:#000; border-radius:8px;">
-          <source src="${ad.metaVideo}" type="video/mp4">
-          Your browser does not support inline video playback.
-        </video>
-        <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Preview served directly from the Meta Marketing API. Signed URL refreshes hourly.</div>`;
-    } else {
-      previewArea.innerHTML = `
-        <img src="${ad.metaThumb}" alt="" style="width:100%; max-height:480px; object-fit:contain; background:#000; border-radius:8px;">
-        <div style="font-size:11px; color:var(--text-dim); margin-top:6px;">Image creative — no video available from Meta for this ad.</div>`;
+  } else if (ad.adId) {
+    // Meta-API ad — resolve the creative on demand (cached after first hit).
+    renderMetaPreview(previewArea, ad);
+    if (!ad.metaVideo && !ad.metaThumb && !_metaCreativeFailed.has(ad.adId)) {
+      _fetchAdCreativeIfNeeded(ad).then(() => {
+        // Only re-render if the user is still looking at this ad.
+        if (currentModalAdId === id) renderMetaPreview(previewArea, ad);
+      });
     }
   } else {
-    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">No creative preview available yet. ${ad.adId ? 'Meta creative resolution may still be in flight — try again in a few seconds.' : 'Connect your Google Sheet or add a "Drive Link" column to match this ad.'}</div>`;
+    previewArea.innerHTML = `<div style="padding:32px; text-align:center; background:var(--surface2); border-radius:8px; color:var(--text-dim); font-size:13px;">No creative preview available. Connect your Google Sheet or add a "Drive Link" column to match this ad.</div>`;
   }
 
   const modalMetrics = document.getElementById('modalMetrics');
