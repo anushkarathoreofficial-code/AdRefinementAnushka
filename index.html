@@ -811,8 +811,8 @@
         </select>
         <input type="password" class="ai-key-input" id="aiKeyInput" placeholder="Paste your Gemini API key (from aistudio.google.com)">
         <select class="model-select" id="aiModelSelect">
-          <option value="gemini-2.0-flash">Gemini 2.0 Flash (fast)</option>
-          <option value="gemini-1.5-pro">Gemini 1.5 Pro (detailed)</option>
+          <option value="gemini-2.5-flash">Gemini 2.5 Flash (fast — recommended)</option>
+          <option value="gemini-2.5-pro">Gemini 2.5 Pro (detailed)</option>
         </select>
         <button class="btn btn-ai" onclick="saveAIKey()">Save Key</button>
         <span class="ai-status" id="aiStatus">Not connected</span>
@@ -2324,12 +2324,20 @@ async function uploadVideoToGeminiHeadless(file, onProgress, signal) {
 
   stage('Processing video', 50);
   let fileState = uploadResult.file?.state;
+  // Adaptive backoff — short ad clips (15-30s) are usually ACTIVE within
+  // 2-3 seconds. Polling every 5s wastes that window. We start at 750ms
+  // and ramp up so short videos catch through fast, long ones don't
+  // hammer the API.
+  const backoffMs = [750, 1500, 2500, 4000, 5000];
   let pollCount = 0;
-  const maxPolls = 60;
-  while (fileState === 'PROCESSING' && pollCount < maxPolls) {
-    await new Promise(r => setTimeout(r, 5000));
+  let elapsedMs = 0;
+  const maxElapsedMs = 5 * 60 * 1000; // 5 min ceiling
+  while (fileState === 'PROCESSING' && elapsedMs < maxElapsedMs) {
+    const delay = backoffMs[Math.min(pollCount, backoffMs.length - 1)];
+    await new Promise(r => setTimeout(r, delay));
+    elapsedMs += delay;
     pollCount++;
-    stage(`Processing video (${pollCount * 5}s)`, Math.min(50 + (pollCount / maxPolls * 45), 95));
+    stage(`Processing video (${Math.round(elapsedMs / 1000)}s)`, Math.min(50 + (elapsedMs / maxElapsedMs * 45), 95));
     const statusResponse = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${aiApiKey}`,
       { signal }
@@ -3325,8 +3333,8 @@ const PROVIDER_CONFIG = {
     placeholder: 'Paste your Gemini API key (from aistudio.google.com)',
     keyUrl: 'https://aistudio.google.com/apikey',
     models: [
-      { value: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash (fast)' },
-      { value: 'gemini-1.5-pro', label: 'Gemini 1.5 Pro (detailed)' }
+      { value: 'gemini-2.5-flash', label: 'Gemini 2.5 Flash (fast — recommended)' },
+      { value: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro (detailed)' }
     ],
     supportsVideo: true
   },
@@ -4382,19 +4390,24 @@ async function uploadVideoToGemini(file) {
   progressBar.style.width = '50%';
   progressPct.textContent = '50%';
 
-  // Step 3: Poll for processing completion
+  // Step 3: Poll for processing completion (adaptive backoff — short clips
+  // are usually ACTIVE within 2-3 seconds; we start at 750ms and ramp up).
   let fileState = uploadResult.file?.state;
+  const backoffMs = [750, 1500, 2500, 4000, 5000];
   let pollCount = 0;
-  const maxPolls = 60; // 5 minutes max
+  let elapsedMs = 0;
+  const maxElapsedMs = 5 * 60 * 1000;
 
-  while (fileState === 'PROCESSING' && pollCount < maxPolls) {
-    await new Promise(r => setTimeout(r, 5000));
+  while (fileState === 'PROCESSING' && elapsedMs < maxElapsedMs) {
+    const delay = backoffMs[Math.min(pollCount, backoffMs.length - 1)];
+    await new Promise(r => setTimeout(r, delay));
+    elapsedMs += delay;
     pollCount++;
 
-    const pct = Math.min(50 + (pollCount / maxPolls * 45), 95);
+    const pct = Math.min(50 + (elapsedMs / maxElapsedMs * 45), 95);
     progressBar.style.width = pct + '%';
     progressPct.textContent = Math.round(pct) + '%';
-    progressLabel.textContent = `Processing video... (${pollCount * 5}s)`;
+    progressLabel.textContent = `Processing video... (${Math.round(elapsedMs / 1000)}s)`;
 
     const statusResponse = await fetch(
       `https://generativelanguage.googleapis.com/v1beta/${fileName}?key=${aiApiKey}`
@@ -4440,7 +4453,10 @@ async function callGeminiWithVideo(prompt, videoFileData) {
     }],
     generationConfig: {
       temperature: 0.7,
-      maxOutputTokens: 4096
+      // Tighter cap — the prompt asks for ~350-400 words (~600 tokens). 2048
+      // leaves comfortable headroom while preventing the model from rambling
+      // for another 30s after it's said everything useful.
+      maxOutputTokens: 2048
     }
   };
 
