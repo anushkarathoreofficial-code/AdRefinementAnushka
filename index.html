@@ -612,7 +612,8 @@
 <div class="header">
   <h1><span>Astrotalk</span> Ad Refinement Dashboard</h1>
   <div class="header-right">
-    <button id="btnRefreshData" onclick="refreshData()" title="Re-pull data from Google Sheets" style="padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;">↻ Refresh data</button>
+    <span id="dataSourceBadge" title="" style="font-size:11px; font-weight:600; padding:5px 10px; border-radius:6px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); margin-right:4px;"></span>
+    <button id="btnRefreshData" onclick="refreshData()" title="Re-pull data from the current source" style="padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;">↻ Refresh data</button>
     <span style="font-size:11px; color:var(--text-dim); font-weight:500; margin-right:8px; padding:5px 10px; border-radius:6px; background:transparent;">Suggestions? Tell Anushka Rathore.</span>
 
     <!-- Hamburger menu — hover or click to reveal tab navigation -->
@@ -1504,9 +1505,14 @@ function setLoadingState(state, message) {
   if (state === 'loading') {
     icon.textContent = '⏳';
     title.textContent = 'Loading dashboard data…';
-    status.textContent = message || (BACKEND.metaApiUrl
-      ? 'Fetching ads from the Meta API and creative links from Google Sheets.'
-      : 'Fetching ads and creative links from Google Sheets.');
+    if (message) {
+      status.textContent = message;
+    } else {
+      const linksTxt = hasLinksSheet() ? ' and creative links from Google Sheets' : '';
+      status.textContent = BACKEND.metaApiUrl
+        ? 'Fetching ads live from the Meta API' + linksTxt + '.'
+        : 'Fetching ads from Google Sheets' + linksTxt + '.';
+    }
     actions.style.display = 'none';
   } else if (state === 'error') {
     icon.textContent = '⚠️';
@@ -1517,50 +1523,102 @@ function setLoadingState(state, message) {
 }
 
 function isConfigured() {
-  const hasMeta = (BACKEND.metaApiUrl)
-               || (BACKEND.metaCsvUrl && !BACKEND.metaCsvUrl.startsWith('PASTE_'));
-  return hasMeta
-      && BACKEND.linksCsvUrl && !BACKEND.linksCsvUrl.startsWith('PASTE_');
+  // Only the meta source is required. The links sheet is OPTIONAL — when it's
+  // configured, creative video URLs get stitched onto the API metrics; when
+  // it's not, ads still load (just without "▶ Watch" preview links).
+  return (BACKEND.metaApiUrl)
+      || (BACKEND.metaCsvUrl && !BACKEND.metaCsvUrl.startsWith('PASTE_'));
+}
+
+function hasLinksSheet() {
+  return BACKEND.linksCsvUrl && !BACKEND.linksCsvUrl.startsWith('PASTE_');
+}
+
+function currentDataSource() {
+  if (BACKEND.metaApiUrl) return 'meta-api';
+  if (BACKEND.metaCsvUrl) return 'sheet';
+  return 'none';
 }
 
 async function loadFromBackend() {
   if (!isConfigured()) {
     setLoadingState('error',
-      'Backend is not configured yet. Set META_TOKEN + META_AD_ACCOUNT (for the Meta API) or META_CSV_URL (for the Sheets fallback), plus LINKS_CSV_URL.');
+      'Backend is not configured yet. Set <code>META_TOKEN</code> + <code>META_AD_ACCOUNT</code> (for the Meta API) or <code>META_CSV_URL</code> (for the Sheets fallback) in Railway → Variables.');
     return;
   }
   setLoadingState('loading');
   try {
-    // Cache-busting param so a freshly republished sheet shows up immediately.
     const sep = (url) => url.includes('?') ? '&' : '?';
     // Prefer the live Meta API endpoint when configured; fall back to CSV.
-    const metaSrc  = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
-    const metaUrl  = metaSrc + sep(metaSrc) + 'cb=' + Date.now();
-    const linksUrl = BACKEND.linksCsvUrl + sep(BACKEND.linksCsvUrl) + 'cb=' + Date.now();
+    const metaSrc = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
+    const metaUrl = metaSrc + sep(metaSrc) + 'cb=' + Date.now();
+
+    // Links sheet fetch runs in parallel only when configured.
+    const linksFetch = hasLinksSheet()
+      ? fetch(BACKEND.linksCsvUrl + sep(BACKEND.linksCsvUrl) + 'cb=' + Date.now(), { cache: 'no-store' })
+      : Promise.resolve(null);
 
     const [metaRes, linksRes] = await Promise.all([
-      fetch(metaUrl,  { cache: 'no-store' }),
-      fetch(linksUrl, { cache: 'no-store' })
+      fetch(metaUrl, { cache: 'no-store', credentials: 'same-origin' }),
+      linksFetch
     ]);
-    if (!metaRes.ok)  throw new Error('Meta sheet fetch failed (' + metaRes.status + '). Make sure it is published to web as CSV.');
-    if (!linksRes.ok) throw new Error('Links sheet fetch failed (' + linksRes.status + '). Make sure it is published to web as CSV.');
+    if (!metaRes.ok) {
+      const detail = await metaRes.text().catch(() => '');
+      throw new Error('Meta data fetch failed (' + metaRes.status + ').' + (detail ? ' ' + detail.slice(0, 200) : ''));
+    }
 
-    const [metaText, linksText] = await Promise.all([metaRes.text(), linksRes.text()]);
+    // Links are best-effort — a failure here only suppresses video previews,
+    // it does not block the ad data from rendering.
+    if (linksRes && linksRes.ok) {
+      try {
+        const linksText = await linksRes.text();
+        linkMap = parseLinkCSV(linksText);
+        linksLoaded = Object.keys(linkMap).length > 0;
+      } catch (e) {
+        console.warn('Links sheet parsed empty:', e);
+        linkMap = {};
+        linksLoaded = false;
+      }
+    } else {
+      // No links sheet configured (or it errored) — that's fine in API-only mode.
+      linkMap = {};
+      linksLoaded = false;
+    }
 
-    // Parse links first so rematchLinks() finds them when ads load.
-    linkMap = parseLinkCSV(linksText);
-    linksLoaded = Object.keys(linkMap).length > 0;
-
+    const metaText = await metaRes.text();
     const ads = parseMetaCSV(metaText);
-    if (!ads.length) throw new Error('Meta sheet has no rows. Check that the sheet has Ad Name + CPI/Hook/Hold/CTI/CPM columns.');
+    if (!ads.length) throw new Error('No ad rows returned. Check that the campaign id and date range have data.');
     ads.forEach((ad, i) => ad.id = i + 1);
     allAds = ads;
     bumpVariationCacheVersion();
     metaCSVLoaded = true;
 
     launchDashboard();
+    updateDataSourceBadge();
   } catch (err) {
-    setLoadingState('error', (err && err.message) || 'Unknown error fetching sheets.');
+    setLoadingState('error', (err && err.message) || 'Unknown error fetching data.');
+  }
+}
+
+// Small badge in the header that shows where ad data is coming from.
+// Lets you confirm at a glance whether the dashboard is reading the live
+// Meta API or the legacy Sheets feed.
+function updateDataSourceBadge() {
+  const el = document.getElementById('dataSourceBadge');
+  if (!el) return;
+  const src = currentDataSource();
+  const linksTxt = hasLinksSheet() ? ' + Sheet (links)' : '';
+  if (src === 'meta-api') {
+    el.textContent = '● Live: Meta API' + linksTxt;
+    el.style.color = '#5cd65c';
+    el.title = 'Ad metrics are streaming from /api/meta-insights.csv (Meta Graph API).' +
+               (hasLinksSheet() ? ' Creative video URLs come from the LINKS_CSV_URL sheet.' : '');
+  } else if (src === 'sheet') {
+    el.textContent = '● Sheet (legacy)';
+    el.style.color = '#f0df20';
+    el.title = 'Ad metrics are coming from the Google Sheet (META_CSV_URL).';
+  } else {
+    el.textContent = '';
   }
 }
 
@@ -5276,6 +5334,7 @@ async function _bootDashboard() {
   if (!ok) return;
   initCollaboration();
   await _loadRuntimeConfig();
+  updateDataSourceBadge();
   await loadFromBackend();
   _startAutoRefresh();
 }
