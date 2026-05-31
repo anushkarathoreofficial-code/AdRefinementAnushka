@@ -533,12 +533,57 @@ app.get('/api/meta-insights.csv', async (req, res) => {
       // re-use as-is (it never leaves the server). We do NOT log it.
       nextUrl = data.paging && data.paging.next ? data.paging.next : null;
     }
+    // Resolve each ad's real created_time (the date it was actually
+    // launched) so the dashboard's date sort is meaningful. Insights'
+    // own date_start is the start of the query window, which is
+    // identical across rows for any preset other than per-day breakdowns.
+    const adIds = Array.from(new Set(rows.map(r => r.ad_id).filter(Boolean)));
+    const createdTimes = await fetchCreatedTimes(adIds, token);
+
     res.set('Cache-Control', 'no-store');
-    res.type('text/csv').send(buildInsightsCSV(rows));
+    res.type('text/csv').send(buildInsightsCSV(rows, createdTimes));
   } catch (err) {
     res.status(502).type('text/plain').send('Meta API fetch failed.');
   }
 });
+
+// ad_id → created_time (ISO 8601). Cached for an hour because ads' creation
+// timestamps don't change after they're created.
+const _createdTimesCache = new Map();
+const CREATED_TIMES_TTL_MS = 60 * 60 * 1000;
+
+async function fetchCreatedTimes(adIds, token) {
+  const result = new Map();
+  const missing = [];
+  const now = Date.now();
+  for (const id of adIds) {
+    const c = _createdTimesCache.get(id);
+    if (c && c.expiresAt > now) result.set(id, c.value);
+    else missing.push(id);
+  }
+  if (!missing.length) return result;
+  // Meta's ?ids=a,b,c batch read tops out at 50 per call. Bigger accounts
+  // would otherwise need one /ad request per ad.
+  const BATCH = 50;
+  for (let i = 0; i < missing.length; i += BATCH) {
+    const batch = missing.slice(i, i + BATCH);
+    const url = `https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(batch.join(','))}` +
+                `&fields=created_time&access_token=${encodeURIComponent(token)}`;
+    try {
+      const r = await fetch(url);
+      const data = await r.json();
+      if (!r.ok || data.error) continue; // non-fatal: row will fall back to date_start
+      for (const id of batch) {
+        const v = data[id] && data[id].created_time;
+        if (v) {
+          result.set(id, v);
+          _createdTimesCache.set(id, { value: v, expiresAt: now + CREATED_TIMES_TTL_MS });
+        }
+      }
+    } catch (_) { /* skip this batch, others may still succeed */ }
+  }
+  return result;
+}
 
 // ---------------- Helpers ----------------
 function sanitizeDatePreset(raw) {
@@ -555,7 +600,7 @@ function sanitizeDatePreset(raw) {
   return allowed.has(v) ? v : 'last_7d';
 }
 
-function buildInsightsCSV(rows) {
+function buildInsightsCSV(rows, createdTimes) {
   const header = [
     'Ad ID','Ad Name','Campaign','Campaign ID','Ad Set','Date',
     'Spend','Impressions','Reach','Frequency',
@@ -597,7 +642,9 @@ function buildInsightsCSV(rows) {
       csvField(row.campaign_name || ''),
       csvField(row.campaign_id || ''),
       csvField(row.adset_name || ''),
-      csvField(row.date_start || ''),
+      // Real launch date (created_time) when available, falling back to
+      // the insights window start. The dashboard's date sort keys off this.
+      csvField((createdTimes && createdTimes.get(row.ad_id)) || row.date_start || ''),
       row.spend || '',
       row.impressions || '',
       row.reach || '',
