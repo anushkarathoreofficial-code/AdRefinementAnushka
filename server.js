@@ -238,7 +238,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     'spend','impressions','reach','frequency',
     'clicks','inline_link_clicks','ctr','cpm','cpc',
     'actions','cost_per_action_type',
-    'video_3_sec_watched_actions','video_thruplay_watched_actions',
+    'video_thruplay_watched_actions',
     'date_start','date_stop'
   ].join(',');
 
@@ -310,7 +310,6 @@ function buildInsightsCSV(rows) {
   for (const row of rows) {
     const actions    = actionsToMap(row.actions);
     const costPer    = actionsToMap(row.cost_per_action_type);
-    const threeSec   = actionsToMap(row.video_3_sec_watched_actions);
     const thruplay   = actionsToMap(row.video_thruplay_watched_actions);
 
     const spend       = num(row.spend);
@@ -319,7 +318,9 @@ function buildInsightsCSV(rows) {
                       || num(actions.app_install)
                       || num(actions.omni_app_install);
     const clicks      = num(row.inline_link_clicks) || num(row.clicks);
-    const threeSecV   = num(threeSec.video_view);
+    // 3-second video plays moved out of the dedicated field in v21+ — they
+    // now live in the standard actions array as action_type=video_view.
+    const threeSecV   = num(actions.video_view);
     const thruplayV   = num(thruplay.video_view);
 
     let cpi = '';
