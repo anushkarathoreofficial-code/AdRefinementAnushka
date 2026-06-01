@@ -66,23 +66,43 @@ function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
 }
 
 // ---------------- CONFIG ----------------
-const DASHBOARD_PASSWORD_HASH = process.env.DASHBOARD_PASSWORD_HASH || '';
+// Railway / shell paste can leave stray whitespace or surrounding quotes on
+// env values. Strip those before validating so a common copy-paste mistake
+// doesn't crash the deploy. The cleaned value is what we use everywhere.
+const DASHBOARD_PASSWORD_HASH = (process.env.DASHBOARD_PASSWORD_HASH || '')
+  .trim()
+  .replace(/^['"]+|['"]+$/g, '');
 const DASHBOARD_PASSWORD      = process.env.DASHBOARD_PASSWORD || '';
 const AUTH_COOKIE_NAME        = 'dashauth';
 const AUTH_COOKIE_MAX_AGE_MS  = 7 * 24 * 60 * 60 * 1000;
 const BCRYPT_MIN_COST         = 10;
 
-// Strict bcrypt format: $2[ayb]$<2-digit cost>$<22 salt chars><31 hash chars>
-function isValidBcryptHash(h) {
-  const m = String(h || '').match(/^\$2[ayb]\$(\d{2})\$[./A-Za-z0-9]{53}$/);
-  return m ? parseInt(m[1], 10) >= BCRYPT_MIN_COST : false;
+// Returns null when the hash looks valid, or a human-readable reason
+// describing what's wrong. Used to produce actionable boot errors so the
+// operator can fix a bad paste without guessing.
+function diagnoseBcryptHash(h) {
+  const s = String(h || '');
+  if (!s) return 'value is empty';
+  if (s.length !== 60) return `wrong length: ${s.length} chars (expected exactly 60). Possible cause: paste was truncated or extra characters were included.`;
+  if (!/^\$2[ayb]\$/.test(s)) return `doesn't start with $2a$/$2b$/$2y$ — looks like you may have pasted the password itself instead of the hash. Run "npm run hash-password" to generate the right value.`;
+  const m = s.match(/^\$2[ayb]\$(\d{2})\$([./A-Za-z0-9]{53})$/);
+  if (!m) return `malformed bcrypt syntax — the prefix is right but the salt/hash portion isn't valid base64-bcrypt.`;
+  const cost = parseInt(m[1], 10);
+  if (cost < BCRYPT_MIN_COST) return `cost factor is ${cost}, need ≥ ${BCRYPT_MIN_COST}. Regenerate with "npm run hash-password" (uses cost 12).`;
+  return null;
 }
 
-if (DASHBOARD_PASSWORD_HASH) {
-  if (!isValidBcryptHash(DASHBOARD_PASSWORD_HASH)) {
+// Did the operator try to set a hash (even if invalid)? If they cleared the
+// var entirely we fall through to the plaintext path instead of crashing.
+const HASH_PROVIDED = (process.env.DASHBOARD_PASSWORD_HASH || '').trim() !== '';
+
+if (HASH_PROVIDED) {
+  const issue = diagnoseBcryptHash(DASHBOARD_PASSWORD_HASH);
+  if (issue) {
     console.error(
-      '\n  ✗  DASHBOARD_PASSWORD_HASH is invalid or has cost factor < ' + BCRYPT_MIN_COST + '.\n' +
-      '     Generate a fresh one with:  npm run hash-password\n'
+      '\n  ✗  DASHBOARD_PASSWORD_HASH is invalid: ' + issue + '\n' +
+      '     Fix the value in Railway → Variables, or temporarily delete\n' +
+      '     DASHBOARD_PASSWORD_HASH to fall back to DASHBOARD_PASSWORD.\n'
     );
     process.exit(1);
   }
