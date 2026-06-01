@@ -785,16 +785,27 @@ app.post('/api/workflow-push', async (req, res) => {
   ];
   try {
     const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
-    const result = await sheets.spreadsheets.values.append({
+    // Race the Sheets call against a 20s timeout. Without this, a stuck
+    // googleapis call (cold-start JWT signing, transient Google outage,
+    // misconfigured service account) would hang the request long enough
+    // for Railway's gateway to 502 with "Application failed to respond" —
+    // leaving the user with no error message to act on. Promise.race lets
+    // us surface a real reason within a predictable window.
+    const writeP = sheets.spreadsheets.values.append({
       spreadsheetId:    ws.workflow_sheet_id,
       range:            `'${ws.workflow_tab.replace(/'/g, "''")}'!A:L`,
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody:      { values: [row] }
     });
+    const timeoutP = new Promise((_, rej) => setTimeout(
+      () => rej(new Error('Google Sheets API timed out after 20s — check that the service account has Editor access on the workflow sheet, and that GOOGLE_CREDENTIALS_JSON is valid.')),
+      20000
+    ));
+    const result = await Promise.race([writeP, timeoutP]);
     // Parse the row number from the Sheets API response so the dashboard
     // can show "appended at row N" feedback in its status toast.
-    const updatedRange = (result.data.updates && result.data.updates.updatedRange) || '';
+    const updatedRange = (result.data && result.data.updates && result.data.updates.updatedRange) || '';
     const m = updatedRange.match(/!A(\d+):/);
     const lastRow = m ? parseInt(m[1], 10) : null;
     res.json({ ok: true, targetSheet: ws.workflow_tab, lastRow });
