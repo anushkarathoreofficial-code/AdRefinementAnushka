@@ -2,13 +2,10 @@
  * Tiny Express server for Railway (or any Node host).
  *
  * Env vars:
- *   DASHBOARD_PASSWORD_HASH  — bcrypt hash of the shared access password.
- *                              Preferred over DASHBOARD_PASSWORD. Cost factor
- *                              must be ≥ 10 (the server refuses to start
- *                              otherwise). Generate with: npm run hash-password.
- *   DASHBOARD_PASSWORD       — plaintext fallback. Used only when no _HASH is
- *                              set. If both are unset, server runs in OPEN
- *                              mode. Never deploy without one of them.
+ *   DASHBOARD_PASSWORD       — required in production. Shared secret that
+ *                              gates every data endpoint (/config.json,
+ *                              /api/*). If unset, server runs in OPEN mode
+ *                              and prints a warning. Never deploy without it.
  *   META_CSV_URL             — (legacy) published Google Sheet CSV for Meta ads
  *   LINKS_CSV_URL            — published Google Sheet CSV for ad-name → Drive link
  *   DRIVE_API_KEY            — Google Drive API key (used for anonymous folder resolution)
@@ -42,7 +39,6 @@
 const express = require('express');
 const path = require('path');
 const crypto = require('crypto');
-const bcrypt = require('bcryptjs');
 
 const app = express();
 // Railway terminates TLS at the edge — trust exactly one proxy hop so
@@ -66,93 +62,27 @@ function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
 }
 
 // ---------------- CONFIG ----------------
-// Railway / shell paste can leave stray whitespace or surrounding quotes on
-// env values. Strip those before validating so a common copy-paste mistake
-// doesn't crash the deploy. The cleaned value is what we use everywhere.
-const DASHBOARD_PASSWORD_HASH = (process.env.DASHBOARD_PASSWORD_HASH || '')
-  .trim()
-  .replace(/^['"]+|['"]+$/g, '');
-const DASHBOARD_PASSWORD      = process.env.DASHBOARD_PASSWORD || '';
-const AUTH_COOKIE_NAME        = 'dashauth';
-const AUTH_COOKIE_MAX_AGE_MS  = 7 * 24 * 60 * 60 * 1000;
-const BCRYPT_MIN_COST         = 10;
+const DASHBOARD_PASSWORD     = process.env.DASHBOARD_PASSWORD || '';
+const AUTH_COOKIE_NAME       = 'dashauth';
+const AUTH_COOKIE_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 
-// Returns null when the hash looks valid, or a human-readable reason
-// describing what's wrong. Used to produce actionable boot errors so the
-// operator can fix a bad paste without guessing.
-function diagnoseBcryptHash(h) {
-  const s = String(h || '');
-  if (!s) return 'value is empty';
-  if (s.length !== 60) return `wrong length: ${s.length} chars (expected exactly 60). Possible cause: paste was truncated or extra characters were included.`;
-  if (!/^\$2[ayb]\$/.test(s)) return `doesn't start with $2a$/$2b$/$2y$ — looks like you may have pasted the password itself instead of the hash. Run "npm run hash-password" to generate the right value.`;
-  const m = s.match(/^\$2[ayb]\$(\d{2})\$([./A-Za-z0-9]{53})$/);
-  if (!m) return `malformed bcrypt syntax — the prefix is right but the salt/hash portion isn't valid base64-bcrypt.`;
-  const cost = parseInt(m[1], 10);
-  if (cost < BCRYPT_MIN_COST) return `cost factor is ${cost}, need ≥ ${BCRYPT_MIN_COST}. Regenerate with "npm run hash-password" (uses cost 12).`;
-  return null;
-}
-
-// Did the operator try to set a hash (even if invalid)? If they cleared the
-// var entirely we fall through to the plaintext path instead of crashing.
-const HASH_PROVIDED = (process.env.DASHBOARD_PASSWORD_HASH || '').trim() !== '';
-
-if (HASH_PROVIDED) {
-  const issue = diagnoseBcryptHash(DASHBOARD_PASSWORD_HASH);
-  if (issue) {
-    console.error(
-      '\n  ✗  DASHBOARD_PASSWORD_HASH is invalid: ' + issue + '\n' +
-      '     Fix the value in Railway → Variables, or temporarily delete\n' +
-      '     DASHBOARD_PASSWORD_HASH to fall back to DASHBOARD_PASSWORD.\n'
-    );
-    process.exit(1);
-  }
-  if (DASHBOARD_PASSWORD) {
-    console.warn(
-      '\n  ⚠  Both DASHBOARD_PASSWORD_HASH and DASHBOARD_PASSWORD are set.\n' +
-      '     Using the hash; the plaintext value is ignored. Remove\n' +
-      '     DASHBOARD_PASSWORD from Railway → Variables to silence this.\n'
-    );
-  }
-} else if (DASHBOARD_PASSWORD) {
+if (!DASHBOARD_PASSWORD) {
   console.warn(
-    '\n  ⚠  Using plaintext DASHBOARD_PASSWORD. For better protection, switch\n' +
-    '     to DASHBOARD_PASSWORD_HASH (generate with: npm run hash-password).\n'
+    '\n  ⚠  DASHBOARD_PASSWORD is not set — running in OPEN mode.\n' +
+    '     All data endpoints are publicly reachable. Set DASHBOARD_PASSWORD\n' +
+    '     in Railway → Variables before exposing this deployment.\n'
   );
-  if (DASHBOARD_PASSWORD.length < 12) {
-    console.warn(
-      '  ⚠  DASHBOARD_PASSWORD is shorter than 12 characters. Pick a longer\n' +
-      '     value or move to a hash — this is the only barrier between the\n' +
-      '     public internet and your Meta ad data.\n'
-    );
-  }
-} else {
+} else if (DASHBOARD_PASSWORD.length < 12) {
   console.warn(
-    '\n  ⚠  Neither DASHBOARD_PASSWORD_HASH nor DASHBOARD_PASSWORD is set —\n' +
-    '     running in OPEN mode. All data endpoints are publicly reachable.\n' +
-    '     Set one of them in Railway → Variables before exposing this deployment.\n'
+    '\n  ⚠  DASHBOARD_PASSWORD is shorter than 12 characters. Pick a longer\n' +
+    '     value — this is the only barrier between the public internet and\n' +
+    '     your Meta ad data.\n'
   );
 }
 
-// Single accessor for "is auth on?" — covers both hash and plaintext modes.
-function authEnabled() {
-  return !!(DASHBOARD_PASSWORD_HASH || DASHBOARD_PASSWORD);
-}
-
-// Cookie HMAC secret. Stable across restarts (same env var → same secret),
-// so cookies survive deploys without forcing everyone to re-login.
-function authSecret() {
-  return DASHBOARD_PASSWORD_HASH || DASHBOARD_PASSWORD;
-}
-
-// Verify a submitted password. Async because bcrypt.compare is, but the
-// plaintext branch resolves synchronously via Promise.resolve.
-async function verifyPassword(input) {
-  if (DASHBOARD_PASSWORD_HASH) {
-    try { return await bcrypt.compare(String(input || ''), DASHBOARD_PASSWORD_HASH); }
-    catch { return false; }
-  }
-  return safeEq(input, DASHBOARD_PASSWORD);
-}
+function authEnabled() { return !!DASHBOARD_PASSWORD; }
+function authSecret()  { return DASHBOARD_PASSWORD; }
+function verifyPassword(input) { return safeEq(input, DASHBOARD_PASSWORD); }
 
 // ---------------- SECURITY HEADERS ----------------
 app.use((req, res, next) => {
