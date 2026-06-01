@@ -1010,7 +1010,23 @@ app.get('/api/meta-insights.csv', async (req, res) => {
   let rows = [];
   let lastError = null;
 
+  // Hard wall-clock budget for the whole cascade. Railway's gateway gives
+  // up on requests that take longer than ~60s — we bail at 45s so the
+  // dashboard always gets a real response (even if it's an error) rather
+  // than a Railway-level 502 "Application failed to respond".
+  const CASCADE_DEADLINE_MS = 45_000;
+  // Per-fetch timeout, intentionally tight. Meta's "too much data" refusal
+  // is usually <2s; a 15s wait already means we should give up on this
+  // preset and try a shorter one.
+  const PER_FETCH_TIMEOUT_MS = 15_000;
+  const cascadeStart = Date.now();
+  const overBudget = () => Date.now() - cascadeStart > CASCADE_DEADLINE_MS;
+
   for (const preset of cascade) {
+    if (overBudget()) {
+      lastError = { message: 'cascade time budget exhausted before reaching ' + preset, code: null };
+      break;
+    }
     rows = [];
     const tryUrl =
       `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
@@ -1022,7 +1038,12 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     let nextUrl = tryUrl;
     try {
       for (let page = 0; nextUrl && page < 50; page++) {
-        const r = await fetchWithTimeout(nextUrl, {}, 30000);
+        if (overBudget()) {
+          lastError = { message: 'cascade time budget exhausted mid-pagination', code: null };
+          pageOk = false;
+          break;
+        }
+        const r = await fetchWithTimeout(nextUrl, {}, PER_FETCH_TIMEOUT_MS);
         const data = await r.json();
         if (!r.ok || data.error) {
           lastError = data.error || { message: 'HTTP ' + r.status, code: null };
@@ -1055,9 +1076,18 @@ app.get('/api/meta-insights.csv', async (req, res) => {
   }
 
   if (effectivePreset == null) {
-    return res.status(502).type('text/plain')
-      .send('Meta API fetch failed across every fallback preset. Last error: ' +
-        (lastError && lastError.message ? lastError.message : 'unknown'));
+    // Common cause: this workspace's ad account is too large to query
+    // without a campaign filter — every preset in the cascade timed out
+    // OR got refused. Tell the user what to do, plainly.
+    const isTimeout = lastError && /budget exhausted|timeout/i.test(lastError.message || '');
+    return res.status(502).type('text/plain').send(
+      (isTimeout
+        ? 'Meta API was too slow / refused every date range. '
+        : 'Meta API fetch failed across every fallback preset. ') +
+      'Most likely cause: this workspace has no campaign filter and the ad account is too large. ' +
+      'Add a "campaign_ids" value to this workspace in the WORKSPACES env var, then redeploy. ' +
+      'Last error: ' + (lastError && lastError.message ? lastError.message : 'unknown')
+    );
   }
 
   try {
