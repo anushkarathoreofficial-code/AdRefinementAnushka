@@ -997,34 +997,70 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     filteringParam = `&filtering=${encodeURIComponent(JSON.stringify(filter))}`;
   }
 
-  const firstUrl =
-    `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
-    `?level=ad&fields=${fields}` +
-    `&date_preset=${encodeURIComponent(datePreset)}` +
-    filteringParam +
-    `&limit=500&access_token=${encodeURIComponent(token)}`;
+  // Preset cascade. If Meta says "too much data" (code 1) for the requested
+  // preset, we re-try with progressively shorter windows. Common on accounts
+  // that have years of history and don't have a campaign filter — asking for
+  // EVERY ad ever just won't fit. Order: requested preset first, then a
+  // shortening sequence skipping anything before the requested window.
+  const PRESET_CASCADE = ['maximum', 'last_year', 'last_90d', 'last_60d', 'last_30d', 'last_14d', 'last_7d'];
+  const startAt = PRESET_CASCADE.indexOf(datePreset);
+  const cascade = startAt >= 0 ? PRESET_CASCADE.slice(startAt) : [datePreset, 'last_30d', 'last_7d'];
+
+  let effectivePreset = null;
+  let rows = [];
+  let lastError = null;
+
+  for (const preset of cascade) {
+    rows = [];
+    const tryUrl =
+      `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
+      `?level=ad&fields=${fields}` +
+      `&date_preset=${encodeURIComponent(preset)}` +
+      filteringParam +
+      `&limit=500&access_token=${encodeURIComponent(token)}`;
+    let pageOk = true;
+    let nextUrl = tryUrl;
+    try {
+      for (let page = 0; nextUrl && page < 50; page++) {
+        const r = await fetchWithTimeout(nextUrl, {}, 30000);
+        const data = await r.json();
+        if (!r.ok || data.error) {
+          lastError = data.error || { message: 'HTTP ' + r.status, code: null };
+          // Meta's "narrow your query" cluster — code 1, or code 100 with the
+          // "reduce the amount of data" verbiage. Try the next shorter preset.
+          const isTooMuch =
+            lastError.code === 1 ||
+            (lastError.code === 100 && /reduce.*amount.*data/i.test(lastError.message || '')) ||
+            /please reduce the amount of data/i.test(lastError.message || '');
+          if (isTooMuch && preset !== cascade[cascade.length - 1]) {
+            pageOk = false;
+            break; // try next preset
+          }
+          // Anything else (auth, perms, network) — surface immediately.
+          return res.status(502).type('text/plain')
+            .send('Meta API error: ' + lastError.message + (lastError.code != null ? ' (code ' + lastError.code + ')' : ''));
+        }
+        if (Array.isArray(data.data)) rows.push(...data.data);
+        const rawNext = data.paging && data.paging.next ? data.paging.next : null;
+        nextUrl = isSafeMetaUrl(rawNext) ? rawNext : null;
+      }
+    } catch (err) {
+      lastError = { message: err.message || String(err), code: null };
+      pageOk = false;
+    }
+    if (pageOk) {
+      effectivePreset = preset;
+      break;
+    }
+  }
+
+  if (effectivePreset == null) {
+    return res.status(502).type('text/plain')
+      .send('Meta API fetch failed across every fallback preset. Last error: ' +
+        (lastError && lastError.message ? lastError.message : 'unknown'));
+  }
 
   try {
-    const rows = [];
-    let nextUrl = firstUrl;
-    for (let page = 0; nextUrl && page < 50; page++) {
-      const r = await fetchWithTimeout(nextUrl, {}, 30000);
-      const data = await r.json();
-      if (!r.ok || data.error) {
-        const msg = data.error
-          ? `${data.error.message} (code ${data.error.code})`
-          : `HTTP ${r.status}`;
-        return res.status(502).type('text/plain').send('Meta API error: ' + msg);
-      }
-      if (Array.isArray(data.data)) rows.push(...data.data);
-      // Validate paging.next: it must point at the real Graph API host before
-      // we re-use it. The URL contains our access token in the query string —
-      // following an attacker-controlled URL would leak the token to them.
-      // Belt-and-braces: TLS to Meta already prevents tampering, but a
-      // surprise Meta-side redirect or response anomaly shouldn't bleed us.
-      const rawNext = data.paging && data.paging.next ? data.paging.next : null;
-      nextUrl = isSafeMetaUrl(rawNext) ? rawNext : null;
-    }
     // Resolve each ad's real created_time (the date it was actually
     // launched) so the dashboard's date sort is meaningful. Insights'
     // own date_start is the start of the query window, which is
@@ -1033,6 +1069,11 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     const createdTimes = await fetchCreatedTimes(adIds, token);
 
     res.set('Cache-Control', 'no-store');
+    // Tells the client which window actually loaded — they can show
+    // "Showing last 90 days (lifetime was too large)" if it differs
+    // from the requested preset.
+    res.set('X-Requested-Date-Preset', datePreset);
+    res.set('X-Effective-Date-Preset', effectivePreset);
     res.type('text/csv').send(buildInsightsCSV(rows, createdTimes));
   } catch (err) {
     res.status(502).type('text/plain').send('Meta API fetch failed.');

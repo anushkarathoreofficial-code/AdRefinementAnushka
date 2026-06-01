@@ -1855,6 +1855,11 @@ async function loadFromBackend() {
     }
 
     const metaText = await metaRes.text();
+    // Server tells us if it had to fall back to a shorter date window
+    // because Meta refused "too much data". Surface that in the badge so
+    // the user knows the dashboard isn't actually showing lifetime.
+    _effectiveDatePreset = metaRes.headers.get('X-Effective-Date-Preset') || '';
+    _requestedDatePreset = metaRes.headers.get('X-Requested-Date-Preset') || '';
     const ads = parseMetaCSV(metaText);
     if (!ads.length) throw new Error('No ad rows returned. Check that the campaign id and date range have data.');
     ads.forEach((ad, i) => ad.id = i + 1);
@@ -1873,6 +1878,34 @@ async function loadFromBackend() {
   }
 }
 
+// What date_preset the user asked for vs. what the server actually
+// returned. Differs only when Meta refused the requested range as too
+// large and the server fell back to a shorter window. Used by the badge
+// to show a clear "scaled back" note.
+let _requestedDatePreset = '';
+let _effectiveDatePreset = '';
+
+function _presetLabel(p) {
+  return ({
+    maximum: 'lifetime',
+    last_year: 'last 365d',
+    last_90d: 'last 90d',
+    last_60d: 'last 60d',
+    last_30d: 'last 30d',
+    last_28d: 'last 28d',
+    last_14d: 'last 14d',
+    last_7d: 'last 7d',
+    last_3d: 'last 3d',
+    yesterday: 'yesterday',
+    today: 'today',
+    this_month: 'this month',
+    last_month: 'last month',
+    this_quarter: 'this quarter',
+    last_quarter: 'last quarter',
+    this_year: 'this year'
+  })[p] || p;
+}
+
 // Small badge in the header that shows where ad data is coming from.
 // Lets you confirm at a glance whether the dashboard is reading the live
 // Meta API or the legacy Sheets feed.
@@ -1881,11 +1914,23 @@ function updateDataSourceBadge() {
   if (!el) return;
   const src = currentDataSource();
   const linksTxt = hasLinksSheet() ? ' + Sheet (links)' : '';
+  // When the server had to fall back to a shorter window (Meta said the
+  // requested range was too large), append a clear note so the user
+  // doesn't think they're looking at "lifetime" when they're not.
+  let presetTxt = '';
+  let presetTitle = '';
+  if (_effectiveDatePreset && _requestedDatePreset && _effectiveDatePreset !== _requestedDatePreset) {
+    presetTxt = ` · ${_presetLabel(_effectiveDatePreset)} (scaled back)`;
+    presetTitle = ` Requested ${_presetLabel(_requestedDatePreset)}, but Meta said that was too much data — fell back to ${_presetLabel(_effectiveDatePreset)}. Add a campaign filter to fetch more.`;
+  } else if (_effectiveDatePreset) {
+    presetTxt = ` · ${_presetLabel(_effectiveDatePreset)}`;
+  }
   if (src === 'meta-api') {
-    el.textContent = '● Live: Meta API' + linksTxt;
+    el.textContent = '● Live: Meta API' + linksTxt + presetTxt;
     el.style.color = '#5cd65c';
     el.title = 'Ad metrics are streaming from /api/meta-insights.csv (Meta Graph API).' +
-               (hasLinksSheet() ? ' Creative video URLs come from the LINKS_CSV_URL sheet.' : '');
+               (hasLinksSheet() ? ' Creative video URLs come from the configured links sheet.' : '') +
+               presetTitle;
   } else if (src === 'sheet') {
     el.textContent = '● Sheet (legacy)';
     el.style.color = '#f0df20';
