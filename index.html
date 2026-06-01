@@ -1134,6 +1134,38 @@ function withWorkspace(url) {
   return url + sep + 'workspace=' + encodeURIComponent(currentWorkspaceId);
 }
 
+// True when the active workspace has a server-side workflow sheet configured
+// (workflow_sheet_id + workflow_tab in WORKSPACES). When true, "+ Workflow"
+// routes via /api/workflow-push instead of the legacy localStorage webhook,
+// so every team member gets the same destination automatically.
+function workspaceHasWorkflow() {
+  if (!currentWorkspaceId) return false;
+  const ws = BACKEND.workspaces.find(w => w.id === currentWorkspaceId);
+  return !!(ws && ws.has_workflow);
+}
+
+// Server-side workflow push. Sends the row through /api/workflow-push, which
+// looks up the workspace's sheet + tab and writes via the service account.
+// Returns the same shape as postToSheet() so the caller can stay agnostic.
+async function postWorkflowViaServer(row) {
+  try {
+    const r = await fetch('/api/workflow-push', {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...row, workspace: currentWorkspaceId || '' })
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok || !body.ok) {
+      return { ok: false, reason: body.error || 'HTTP ' + r.status };
+    }
+    return { ok: true, body };
+  } catch (e) {
+    return { ok: false, reason: (e && e.message) || 'network error' };
+  }
+}
+
 // Render the tab strip at the top of the dashboard. Called on boot and any
 // time the workspace list changes. Skips render entirely when there's < 2
 // workspaces — the strip would just be visual noise.
@@ -5440,8 +5472,18 @@ async function submitSuggestion(adId) {
   if (editorName) workflowItems[idx].stage = 'assigned';
   saveWorkflow();
 
-  // Push to Google Sheet (one row per variation)
-  if (pushSheet && getSheetWebhook()) {
+  // Push to Google Sheet (one row per variation).
+  //
+  // Two routing paths:
+  //   A) Server-side per workspace (preferred). When the active workspace's
+  //      WORKSPACES entry has workflow_sheet_id + workflow_tab, the dashboard
+  //      POSTs to /api/workflow-push and the server writes via the service
+  //      account. Works for every user on every device with no per-user
+  //      setup.
+  //   B) Legacy localStorage Apps Script webhook. Used when the workspace
+  //      hasn't been migrated to server-side, or in single-workspace mode.
+  const useServerWorkflow = workspaceHasWorkflow();
+  if (pushSheet && (useServerWorkflow || getSheetWebhook())) {
     statusEl.textContent = 'Sending to Google Sheet...';
     const row = {
       date: todayLabel,
@@ -5456,9 +5498,11 @@ async function submitSuggestion(adId) {
       variation: text,
       driveLink: ad.link || ''
     };
-    const res = await postToSheet(row);
+    const res = useServerWorkflow
+      ? await postWorkflowViaServer(row)
+      : await postToSheet(row);
     if (res.ok && res.body?.targetSheet) {
-      statusEl.innerHTML = `<span style="color:var(--green);">\u2713 Row appended to "${res.body.targetSheet}" (row ${res.body.lastRow})</span>`;
+      statusEl.innerHTML = `<span style="color:var(--green);">\u2713 Row appended to "${res.body.targetSheet}"${res.body.lastRow ? ' (row ' + res.body.lastRow + ')' : ''}</span>`;
     } else if (res.ok) {
       statusEl.innerHTML = '<span style="color:var(--green);">\u2713 Row sent to Sheet</span>';
     } else {

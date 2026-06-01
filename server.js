@@ -18,14 +18,19 @@
  *   META_DATE_PRESET         — optional, defaults to "last_7d"
  *   WORKSPACES               — JSON array of workspace configs. Each entry:
  *                                {
- *                                  "id":         "foreign",                 // url-safe slug
- *                                  "label":      "Astrotalk Foreign",       // shown on the tab
- *                                  "ad_account": "act_2021416865462021",    // with act_ prefix
- *                                  "campaign_ids": "120243586878400130",    // optional
- *                                  "sheet_id":   "18__KDrig..."             // links sheet id
+ *                                  "id":                "foreign",                 // url-safe slug
+ *                                  "label":             "Astrotalk Foreign",       // shown on the tab
+ *                                  "ad_account":        "act_2021416865462021",    // with act_ prefix
+ *                                  "campaign_ids":      "120243586878400130",      // optional
+ *                                  "sheet_id":          "18__KDrig...",            // links sheet id
+ *                                  "workflow_sheet_id": "1m3dNzNZ...",             // optional — for + Workflow rows
+ *                                  "workflow_tab":      "Variation-foreign"        // optional — tab name within that sheet
  *                                }
  *                              If unset, the server falls back to a single
  *                              workspace built from the legacy env vars below.
+ *                              The workflow_sheet_id is OPTIONAL per workspace —
+ *                              workspaces without it fall back to the legacy
+ *                              per-browser webhook configured in Settings.
  *   META_AD_ACCOUNT          — (legacy) single-workspace ad account
  *   META_CAMPAIGN_IDS        — (legacy) single-workspace campaign filter
  *   GEMINI_API_KEY           — optional. When set, every signed-in dashboard
@@ -115,11 +120,16 @@ function getWorkspaces() {
     _workspaceCache = parsed
       .filter(w => w && typeof w === 'object' && w.id && w.ad_account)
       .map(w => ({
-        id:           String(w.id).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40),
-        label:        String(w.label || w.id),
-        ad_account:   String(w.ad_account),
-        campaign_ids: String(w.campaign_ids || '').trim(),
-        sheet_id:     String(w.sheet_id || '').trim()
+        id:                String(w.id).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40),
+        label:             String(w.label || w.id),
+        ad_account:        String(w.ad_account),
+        campaign_ids:      String(w.campaign_ids || '').trim(),
+        sheet_id:          String(w.sheet_id || '').trim(),
+        // Optional — drives the /api/workflow-push endpoint. When set, every
+        // "+ Workflow" submission for this workspace lands here automatically
+        // (no per-user webhook setup needed).
+        workflow_sheet_id: String(w.workflow_sheet_id || '').trim(),
+        workflow_tab:      String(w.workflow_tab || '').trim()
       }))
       .filter(w => w.id);
   } else {
@@ -140,9 +150,14 @@ function getWorkspace(id) {
   return list.find(w => w.id === id) || list[0];
 }
 // Public summary for the client — never includes the sheet id (privacy) or
-// campaign ids (operational detail). Just enough to render the tab strip.
+// campaign ids (operational detail). Just enough to render the tab strip
+// and decide whether the "+ Workflow" button should route server-side.
 function publicWorkspaces() {
-  return getWorkspaces().map(w => ({ id: w.id, label: w.label }));
+  return getWorkspaces().map(w => ({
+    id: w.id,
+    label: w.label,
+    has_workflow: !!(w.workflow_sheet_id && w.workflow_tab)
+  }));
 }
 
 // ---------------- SECURITY HEADERS ----------------
@@ -165,7 +180,9 @@ app.use((req, res, next) => {
 const jsonStrict = express.json({ limit: '1kb' });
 const jsonLarge  = express.json({ limit: '100kb' });
 app.use((req, res, next) => {
-  if (req.path === '/api/save-analysis') return jsonLarge(req, res, next);
+  if (req.path === '/api/save-analysis' || req.path === '/api/workflow-push') {
+    return jsonLarge(req, res, next);
+  }
   return jsonStrict(req, res, next);
 });
 
@@ -724,6 +741,68 @@ app.get('/api/recent-winners', async (req, res) => {
 function tryParseJSON(s) {
   try { return JSON.parse(s); } catch { return null; }
 }
+
+// ---------------- /api/workflow-push — write a "+ Workflow" row to a sheet ----
+// Server-side replacement for the legacy localStorage Apps Script webhook.
+// When a workspace has workflow_sheet_id + workflow_tab configured, every
+// "+ Workflow" submission from any signed-in user, on any device, lands in
+// the right tab automatically — no per-user setup, no Apps Script deploy.
+//
+// Row layout matches the existing tracking sheet's column order (verified
+// against the user's screenshot of "All AI Concepts track-ppp"):
+//   A Date | B Idea Num | C Ad Name | D Script By | E V | F Status |
+//   G Editor | H (reserved/unused) | I Platform | J Variation |
+//   K Drive link | L Date done
+app.post('/api/workflow-push', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasDriveSA()) {
+    return res.status(503).json({ ok: false, error: 'Workflow push requires GOOGLE_CREDENTIALS_JSON on the server.' });
+  }
+  const b = req.body || {};
+  const ws = getWorkspace(b.workspace);
+  if (!ws.workflow_sheet_id || !ws.workflow_tab) {
+    return res.status(503).json({ ok: false, error: 'Workflow sheet not configured for workspace "' + ws.id + '". Add workflow_sheet_id + workflow_tab to its WORKSPACES entry.' });
+  }
+  // Light input validation. We don't want a 50KB "variation" field — that
+  // would never be a legitimate write, only a misuse / typo.
+  const variation = String(b.variation || '').trim();
+  if (variation.length > 10000) {
+    return res.status(413).json({ ok: false, error: 'variation text too long (10k max)' });
+  }
+  const row = [
+    String(b.date         || ''),
+    String(b.ideaNum      || ''),
+    String(b.adName       || ''),
+    String(b.scriptBy     || ''),
+    String(b.variationNum || b.poc || ''),
+    String(b.status       || 'In Progress'),
+    String(b.editor       || ''),
+    '',                                   // column H — reserved, kept empty
+    String(b.platform     || ''),
+    variation,
+    String(b.driveLink    || ''),
+    ''                                    // L "Date done" — filled in manually when work completes
+  ];
+  try {
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const result = await sheets.spreadsheets.values.append({
+      spreadsheetId:    ws.workflow_sheet_id,
+      range:            `'${ws.workflow_tab.replace(/'/g, "''")}'!A:L`,
+      valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
+      requestBody:      { values: [row] }
+    });
+    // Parse the row number from the Sheets API response so the dashboard
+    // can show "appended at row N" feedback in its status toast.
+    const updatedRange = (result.data.updates && result.data.updates.updatedRange) || '';
+    const m = updatedRange.match(/!A(\d+):/);
+    const lastRow = m ? parseInt(m[1], 10) : null;
+    res.json({ ok: true, targetSheet: ws.workflow_tab, lastRow });
+  } catch (err) {
+    const msg = (err.errors && err.errors[0] && err.errors[0].message) || err.message || 'unknown';
+    res.status(502).json({ ok: false, error: 'Sheet write failed: ' + msg });
+  }
+});
 
 // ---------------- Meta API: connection test ----------------
 app.get('/api/ad-metrics', async (req, res) => {
