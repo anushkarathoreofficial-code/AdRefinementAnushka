@@ -45,10 +45,25 @@ const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 
 const app = express();
-// Railway terminates TLS at the edge; honour X-Forwarded-* so req.ip is real
-// (rate limiter relies on it) and req.secure works for the Secure cookie flag.
-app.set('trust proxy', true);
+// Railway terminates TLS at the edge — trust exactly one proxy hop so
+// req.ip reflects the real client IP for the rate limiter. Using `true`
+// (any hops) would let a client spoof X-Forwarded-For and bypass per-IP
+// limits; `1` only trusts the hop closest to us (Railway's edge router).
+app.set('trust proxy', 1);
 app.disable('x-powered-by');
+
+// AbortController-based fetch with a hard wall-clock timeout. Wraps every
+// outbound call to Meta / Google so a stuck remote can't hold server
+// resources indefinitely.
+function fetchWithTimeout(url, init = {}, timeoutMs = 30000) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(new Error('fetch timeout after ' + timeoutMs + 'ms')), timeoutMs);
+  // Combine our timeout with any caller-provided signal.
+  if (init.signal) {
+    init.signal.addEventListener('abort', () => ctrl.abort(init.signal.reason), { once: true });
+  }
+  return fetch(url, { ...init, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
 
 // ---------------- CONFIG ----------------
 const DASHBOARD_PASSWORD_HASH = process.env.DASHBOARD_PASSWORD_HASH || '';
@@ -129,8 +144,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// Small JSON body limit — only /api/login uses a body.
-app.use(express.json({ limit: '1kb' }));
+// Per-route JSON body limits. /api/login takes a tiny credential payload
+// (~few hundred bytes max) so we keep that strict to make body-flood DoS
+// useless. /api/save-analysis carries a Gemini snapshot which can run
+// 2-5KB of markdown — its dedicated parser allows up to 100KB. Every
+// other route gets the strict 1KB default; routes that don't read
+// bodies (most GETs) pay nothing because the parser is a no-op when
+// there's no Content-Type: application/json header.
+const jsonStrict = express.json({ limit: '1kb' });
+const jsonLarge  = express.json({ limit: '100kb' });
+app.use((req, res, next) => {
+  if (req.path === '/api/save-analysis') return jsonLarge(req, res, next);
+  return jsonStrict(req, res, next);
+});
 
 // ---------------- AUTH HELPERS ----------------
 function safeEq(a, b) {
@@ -346,7 +372,9 @@ app.get('/api/drive-stream', async (req, res) => {
     const headers = { Authorization: `Bearer ${token}` };
     if (req.headers.range) headers.Range = req.headers.range;
     const driveUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
-    const driveRes = await fetch(driveUrl, { headers });
+    // Longer timeout — videos can take a while to stream. The timeout
+    // governs the time-to-first-byte, not the full body transfer.
+    const driveRes = await fetchWithTimeout(driveUrl, { headers }, 60000);
     res.status(driveRes.status);
     for (const h of ['content-type', 'content-length', 'content-range', 'accept-ranges']) {
       const v = driveRes.headers.get(h);
@@ -355,7 +383,12 @@ app.get('/api/drive-stream', async (req, res) => {
     res.set('Cache-Control', 'no-store');
     if (!driveRes.body) return res.end();
     const { Readable } = require('node:stream');
-    Readable.fromWeb(driveRes.body).pipe(res);
+    const nodeStream = Readable.fromWeb(driveRes.body);
+    // Without these handlers, a mid-stream error from Drive (network blip,
+    // quota cutoff) crashes the Node process with an unhandled exception.
+    nodeStream.on('error', () => { try { res.end(); } catch (_) {} });
+    res.on('close', () => { try { nodeStream.destroy(); } catch (_) {} });
+    nodeStream.pipe(res);
   } catch (err) {
     res.status(502).type('text/plain').send('Drive stream failed.');
   }
@@ -375,13 +408,16 @@ app.get('/api/drive-thumbnail', async (req, res) => {
     const link = meta.data.thumbnailLink;
     if (!link) return res.status(404).end();
     const finalUrl = link.replace(/=s\d+$/, '=s400');
-    const r = await fetch(finalUrl);
+    const r = await fetchWithTimeout(finalUrl, {}, 15000);
     res.status(r.status);
     res.set('content-type', r.headers.get('content-type') || 'image/jpeg');
     res.set('Cache-Control', 'private, max-age=3600');
     if (!r.body) return res.end();
     const { Readable } = require('node:stream');
-    Readable.fromWeb(r.body).pipe(res);
+    const nodeStream = Readable.fromWeb(r.body);
+    nodeStream.on('error', () => { try { res.end(); } catch (_) {} });
+    res.on('close', () => { try { nodeStream.destroy(); } catch (_) {} });
+    nodeStream.pipe(res);
   } catch (err) {
     res.status(502).end();
   }
@@ -588,7 +624,7 @@ app.get('/api/ad-metrics', async (req, res) => {
               `&date_preset=${encodeURIComponent(datePreset)}` +
               `&access_token=${encodeURIComponent(token)}`;
   try {
-    const r = await fetch(url);
+    const r = await fetchWithTimeout(url);
     const data = await r.json();
     res.set('Cache-Control', 'no-store');
     // Forward the Graph response verbatim — it contains metrics on success
@@ -634,7 +670,7 @@ app.get('/api/ad-creative', async (req, res) => {
     const adUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(adId)}` +
                   `?fields=creative{${creativeFields}}` +
                   `&access_token=${encodeURIComponent(token)}`;
-    const adRes = await fetch(adUrl);
+    const adRes = await fetchWithTimeout(adUrl);
     const adData = await adRes.json();
     if (!adRes.ok || adData.error) {
       const msg = adData.error ? `${adData.error.message} (code ${adData.error.code})` : `HTTP ${adRes.status}`;
@@ -649,7 +685,7 @@ app.get('/api/ad-creative', async (req, res) => {
     if (videoId) {
       const vidUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}` +
                      `?fields=source&access_token=${encodeURIComponent(token)}`;
-      const vidRes = await fetch(vidUrl);
+      const vidRes = await fetchWithTimeout(vidUrl);
       const vidData = await vidRes.json();
       if (vidRes.ok && !vidData.error && vidData.source) videoUrl = vidData.source;
     }
@@ -663,7 +699,7 @@ app.get('/api/ad-creative', async (req, res) => {
         const postUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(creative.effective_object_story_id)}` +
                         `?fields=attachments{media,media_type,subattachments}` +
                         `&access_token=${encodeURIComponent(token)}`;
-        const postRes = await fetch(postUrl);
+        const postRes = await fetchWithTimeout(postUrl);
         const postData = await postRes.json();
         if (postRes.ok && !postData.error) {
           const found = extractFromPostAttachments(postData.attachments);
@@ -777,7 +813,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     const rows = [];
     let nextUrl = firstUrl;
     for (let page = 0; nextUrl && page < 50; page++) {
-      const r = await fetch(nextUrl);
+      const r = await fetchWithTimeout(nextUrl, {}, 30000);
       const data = await r.json();
       if (!r.ok || data.error) {
         const msg = data.error
@@ -786,9 +822,13 @@ app.get('/api/meta-insights.csv', async (req, res) => {
         return res.status(502).type('text/plain').send('Meta API error: ' + msg);
       }
       if (Array.isArray(data.data)) rows.push(...data.data);
-      // Meta's paging.next URL contains the access token; that's fine to
-      // re-use as-is (it never leaves the server). We do NOT log it.
-      nextUrl = data.paging && data.paging.next ? data.paging.next : null;
+      // Validate paging.next: it must point at the real Graph API host before
+      // we re-use it. The URL contains our access token in the query string —
+      // following an attacker-controlled URL would leak the token to them.
+      // Belt-and-braces: TLS to Meta already prevents tampering, but a
+      // surprise Meta-side redirect or response anomaly shouldn't bleed us.
+      const rawNext = data.paging && data.paging.next ? data.paging.next : null;
+      nextUrl = isSafeMetaUrl(rawNext) ? rawNext : null;
     }
     // Resolve each ad's real created_time (the date it was actually
     // launched) so the dashboard's date sort is meaningful. Insights'
@@ -827,7 +867,7 @@ async function fetchCreatedTimes(adIds, token) {
     const url = `https://graph.facebook.com/v21.0/?ids=${encodeURIComponent(batch.join(','))}` +
                 `&fields=created_time&access_token=${encodeURIComponent(token)}`;
     try {
-      const r = await fetch(url);
+      const r = await fetchWithTimeout(url);
       const data = await r.json();
       if (!r.ok || data.error) continue; // non-fatal: row will fall back to date_start
       for (const id of batch) {
@@ -843,6 +883,17 @@ async function fetchCreatedTimes(adIds, token) {
 }
 
 // ---------------- Helpers ----------------
+// SSRF defense: only follow URLs that point at the Graph API. Used for
+// paging.next, which arrives over the wire with our access token in the
+// query string — we must never forward that to anywhere else.
+function isSafeMetaUrl(u) {
+  if (!u || typeof u !== 'string') return false;
+  try {
+    const parsed = new URL(u);
+    return parsed.protocol === 'https:' && parsed.hostname === 'graph.facebook.com';
+  } catch { return false; }
+}
+
 function sanitizeDatePreset(raw) {
   const v = String(raw || '').trim().toLowerCase();
   // Whitelist Graph API's documented date_preset values. Anything else falls
@@ -942,6 +993,19 @@ app.get('/index.html', (req, res) => res.redirect(301, '/'));
 
 // Final catch-all → 404 JSON. Keeps the surface area tight.
 app.use((req, res) => res.status(404).json({ error: 'not found' }));
+
+// Centralised error handler — returns a clean JSON error without leaking
+// stack traces or absolute file paths. Express's default handler dumps the
+// stack into the response body in non-production environments, which is
+// fine for debugging but not for an exposed deployment.
+app.use((err, req, res, _next) => {
+  if (res.headersSent) return; // streaming response already started
+  const status = (err && (err.status || err.statusCode)) || 500;
+  let message = 'server error';
+  if (status === 413) message = 'request body too large';
+  else if (status === 400) message = 'bad request';
+  res.status(status).json({ error: message });
+});
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
