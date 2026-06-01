@@ -611,6 +611,8 @@
 
 <div class="header">
   <h1><span>Astrotalk</span> Ad Refinement Dashboard</h1>
+  <!-- Multi-workspace tab strip. Hidden when only one workspace is configured. -->
+  <div id="workspaceTabs" style="display:none; gap:6px; align-items:center; margin-left:18px;"></div>
   <div class="header-right">
     <span id="dataSourceBadge" title="" style="font-size:11px; font-weight:600; padding:5px 10px; border-radius:6px; background:var(--surface); border:1px solid var(--border); color:var(--text-dim); margin-right:4px;"></span>
     <button id="btnRefreshData" onclick="refreshData()" title="Re-pull data from the current source" style="padding:6px 14px; border-radius:6px; border:1px solid var(--border); background:var(--surface); color:var(--text); font-size:12px; font-weight:600; cursor:pointer;">↻ Refresh data</button>
@@ -994,18 +996,21 @@
 const BACKEND = {
   metaCsvUrl:  '',
   linksCsvUrl: '',
-  // When the server has META_TOKEN + META_AD_ACCOUNT set, this points at the
-  // Node proxy (/api/meta-insights.csv) and takes priority over metaCsvUrl.
   metaApiUrl:  '',
-  // When the server has GOOGLE_CREDENTIALS_JSON set, route Drive thumbnails
-  // and video bytes through the server (service-account proxy). Lets us
-  // play files behind a "sign-in required" sharing policy.
   driveProxyEnabled: false,
-  // When the server has ANALYSIS_SHEET_ID set, every completed Gemini
-  // analysis is persisted, instantly re-rendered on modal re-open, and
-  // recent winners are injected into new analysis prompts as context.
-  analysisHistoryEnabled: false
+  analysisHistoryEnabled: false,
+  // Array of {id, label} workspace configs the server is set up with.
+  // When this has 2+ entries, the dashboard renders a tab strip at the top
+  // and routes every fetch to ?workspace=<currentWorkspaceId>. With 0 or 1
+  // entries the dashboard runs in single-workspace mode (no tabs).
+  workspaces: []
 };
+
+// Currently active workspace. Persisted in localStorage so reload keeps the
+// last-used tab. Set from /config.json on boot. Empty string = "no
+// workspace param" (single-workspace legacy mode).
+let currentWorkspaceId = '';
+const WORKSPACE_STORAGE_KEY = 'astrotalk:current-workspace';
 
 // Meta creative cache (ad_id → {video_url, thumbnail_url, image_url}). The
 // server already caches for ~50min; this session cache lets a re-parse of
@@ -1121,6 +1126,62 @@ function attachCardCreativeObserver() {
   document.querySelectorAll('.card[data-ad-id]').forEach(el => _cardCreativeObserver.observe(el));
 }
 
+// Append ?workspace=<id> to a URL when running in multi-workspace mode.
+// No-op for single-workspace deployments so URLs stay clean.
+function withWorkspace(url) {
+  if (!currentWorkspaceId) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return url + sep + 'workspace=' + encodeURIComponent(currentWorkspaceId);
+}
+
+// Render the tab strip at the top of the dashboard. Called on boot and any
+// time the workspace list changes. Skips render entirely when there's < 2
+// workspaces — the strip would just be visual noise.
+function renderWorkspaceTabs() {
+  const host = document.getElementById('workspaceTabs');
+  if (!host) return;
+  if (!BACKEND.workspaces || BACKEND.workspaces.length < 2) {
+    host.style.display = 'none';
+    host.innerHTML = '';
+    return;
+  }
+  host.style.display = 'flex';
+  host.innerHTML = BACKEND.workspaces.map(w => {
+    const active = w.id === currentWorkspaceId;
+    return `<button class="ws-tab ${active ? 'ws-tab-active' : ''}" data-ws-id="${w.id}"
+              style="padding:6px 14px; border-radius:6px; font-size:12px; font-weight:600; cursor:pointer;
+                     border:1px solid ${active ? 'var(--accent)' : 'var(--border)'};
+                     background:${active ? 'var(--accent-bg)' : 'var(--surface)'};
+                     color:${active ? 'var(--accent)' : 'var(--text)'};">${w.label}</button>`;
+  }).join('');
+  host.querySelectorAll('.ws-tab').forEach(el => {
+    el.addEventListener('click', () => switchWorkspace(el.getAttribute('data-ws-id')));
+  });
+}
+
+async function switchWorkspace(id) {
+  if (!id || id === currentWorkspaceId) return;
+  const target = BACKEND.workspaces.find(w => w.id === id);
+  if (!target) return;
+  currentWorkspaceId = id;
+  try { localStorage.setItem(WORKSPACE_STORAGE_KEY, id); } catch (_) {}
+  // Clear all the in-session state that's workspace-specific so the new
+  // tab's data doesn't get blended with the old tab's leftovers.
+  allAds = [];
+  linkMap = {};
+  linksLoaded = false;
+  metaCSVLoaded = false;
+  aiCache = {};
+  _metaCreativeCache.clear();
+  _metaCreativeInflight.clear();
+  _metaCreativeFailed.clear();
+  _metaCreativeErrors.clear();
+  _storedAnalysisProbed.clear();
+  renderWorkspaceTabs();
+  updateDataSourceBadge();
+  await loadFromBackend();
+}
+
 async function _loadRuntimeConfig() {
   try {
     const res = await fetch('/config.json', { cache: 'no-store' });
@@ -1131,8 +1192,18 @@ async function _loadRuntimeConfig() {
     BACKEND.metaApiUrl        = cfg.metaApiUrl  || '';
     BACKEND.driveProxyEnabled = !!cfg.driveProxyEnabled;
     BACKEND.analysisHistoryEnabled = !!cfg.analysisHistoryEnabled;
+    BACKEND.workspaces = Array.isArray(cfg.workspaces) ? cfg.workspaces : [];
     if (cfg.driveApiKey) _runtimeDriveApiKey = cfg.driveApiKey;
     if (cfg.geminiApiKey) _runtimeGeminiKey = cfg.geminiApiKey;
+
+    // Initial workspace selection: stored preference if it's still valid,
+    // else the first workspace in the list. With < 2 workspaces we leave
+    // currentWorkspaceId empty so URLs stay clean for legacy deployments.
+    if (BACKEND.workspaces.length >= 2) {
+      const stored = (typeof localStorage !== 'undefined') ? localStorage.getItem(WORKSPACE_STORAGE_KEY) : '';
+      const valid = BACKEND.workspaces.find(w => w.id === stored);
+      currentWorkspaceId = valid ? valid.id : BACKEND.workspaces[0].id;
+    }
   } catch (e) {
     console.warn('Could not load /config.json — falling back to empty config:', e);
   }
@@ -1673,14 +1744,19 @@ function setLoadingState(state, message) {
 }
 
 function isConfigured() {
-  // Only the meta source is required. The links sheet is OPTIONAL — when it's
-  // configured, creative video URLs get stitched onto the API metrics; when
-  // it's not, ads still load (just without "▶ Watch" preview links).
+  // Multi-workspace mode is configured the moment there's at least one
+  // workspace with an ad account on the server. Otherwise fall back to the
+  // legacy single-source check.
+  if (BACKEND.workspaces && BACKEND.workspaces.length) return !!BACKEND.metaApiUrl;
   return (BACKEND.metaApiUrl)
       || (BACKEND.metaCsvUrl && !BACKEND.metaCsvUrl.startsWith('PASTE_'));
 }
 
 function hasLinksSheet() {
+  // In multi-workspace mode every workspace has its own server-side sheet
+  // proxy, so "do we have a links source" is always true. Otherwise we fall
+  // back to the legacy LINKS_CSV_URL Apps Script.
+  if (currentWorkspaceId) return true;
   return BACKEND.linksCsvUrl && !BACKEND.linksCsvUrl.startsWith('PASTE_');
 }
 
@@ -1700,12 +1776,23 @@ async function loadFromBackend() {
   try {
     const sep = (url) => url.includes('?') ? '&' : '?';
     // Prefer the live Meta API endpoint when configured; fall back to CSV.
-    const metaSrc = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
+    // withWorkspace() appends ?workspace=<id> only when we're in
+    // multi-workspace mode — single-workspace deployments keep clean URLs.
+    let metaSrc = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
+    if (BACKEND.metaApiUrl) metaSrc = withWorkspace(metaSrc);
     const metaUrl = metaSrc + sep(metaSrc) + 'cb=' + Date.now();
 
-    // Links sheet fetch runs in parallel only when configured.
-    const linksFetch = hasLinksSheet()
-      ? fetch(BACKEND.linksCsvUrl + sep(BACKEND.linksCsvUrl) + 'cb=' + Date.now(), { cache: 'no-store' })
+    // Links source priority:
+    //   1. /api/links.csv?workspace=<id> when this workspace has a sheet_id
+    //      configured on the server (server reads via service account).
+    //   2. Legacy LINKS_CSV_URL (Apps Script proxy) for single-workspace
+    //      deployments that haven't migrated.
+    //   3. None — dashboard runs without creative previews.
+    const linksUrl = currentWorkspaceId
+      ? withWorkspace('/api/links.csv')
+      : (hasLinksSheet() ? BACKEND.linksCsvUrl + sep(BACKEND.linksCsvUrl) + 'cb=' + Date.now() : '');
+    const linksFetch = linksUrl
+      ? fetch(linksUrl, { cache: 'no-store', credentials: 'same-origin' })
       : Promise.resolve(null);
 
     const [metaRes, linksRes] = await Promise.all([
@@ -3341,7 +3428,8 @@ const _storedAnalysisProbed = new Set();
 async function fetchPastWinners() {
   if (!BACKEND.analysisHistoryEnabled) return [];
   try {
-    const r = await fetch('/api/recent-winners?limit=3', { credentials: 'same-origin', cache: 'no-store' });
+    const r = await fetch(withWorkspace('/api/recent-winners?limit=3'),
+                          { credentials: 'same-origin', cache: 'no-store' });
     if (!r.ok) return [];
     const data = await r.json();
     return Array.isArray(data.winners) ? data.winners : [];
@@ -3351,7 +3439,7 @@ async function fetchPastWinners() {
 async function fetchStoredAnalysis(adId) {
   if (!BACKEND.analysisHistoryEnabled) return null;
   try {
-    const r = await fetch('/api/analysis-for-ad?ad_id=' + encodeURIComponent(adId),
+    const r = await fetch(withWorkspace('/api/analysis-for-ad?ad_id=' + encodeURIComponent(adId)),
                           { credentials: 'same-origin', cache: 'no-store' });
     if (!r.ok) return null;
     const data = await r.json();
@@ -3381,7 +3469,11 @@ async function saveAnalysisToHistory(ad, mode, responseText) {
         metrics: ad.metrics,
         snapshot: responseText,
         provider: aiProvider,
-        model: document.getElementById('aiModelSelect') ? document.getElementById('aiModelSelect').value : ''
+        model: document.getElementById('aiModelSelect') ? document.getElementById('aiModelSelect').value : '',
+        // Server tags the row with this so each workspace's recent-winners
+        // query only sees its own history (no cross-pollination across
+        // brands like Lumus vs. Astrotalk).
+        workspace: currentWorkspaceId || ''
       })
     });
   } catch (_) { /* non-fatal: history write is best-effort */ }
@@ -5730,6 +5822,7 @@ async function _bootDashboard() {
   if (!ok) return;
   initCollaboration();
   await _loadRuntimeConfig();
+  renderWorkspaceTabs();
   updateDataSourceBadge();
   _autoConnectGeminiFromConfig();
   await loadFromBackend();

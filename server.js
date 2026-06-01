@@ -13,10 +13,21 @@
  *                              proxies Drive thumbnails + video bytes through the
  *                              server using this account, which lets it serve files
  *                              that are restricted to "sign-in required" sharing.
- *   META_TOKEN               — Meta Marketing API long-lived access token
- *   META_AD_ACCOUNT          — Meta ad account, e.g. "act_123456789"
+ *   META_TOKEN               — Meta Marketing API long-lived access token. Must
+ *                              have read access to every workspace's ad account.
  *   META_DATE_PRESET         — optional, defaults to "last_7d"
- *   META_CAMPAIGN_IDS        — optional, comma-separated campaign ids to limit to
+ *   WORKSPACES               — JSON array of workspace configs. Each entry:
+ *                                {
+ *                                  "id":         "foreign",                 // url-safe slug
+ *                                  "label":      "Astrotalk Foreign",       // shown on the tab
+ *                                  "ad_account": "act_2021416865462021",    // with act_ prefix
+ *                                  "campaign_ids": "120243586878400130",    // optional
+ *                                  "sheet_id":   "18__KDrig..."             // links sheet id
+ *                                }
+ *                              If unset, the server falls back to a single
+ *                              workspace built from the legacy env vars below.
+ *   META_AD_ACCOUNT          — (legacy) single-workspace ad account
+ *   META_CAMPAIGN_IDS        — (legacy) single-workspace campaign filter
  *   GEMINI_API_KEY           — optional. When set, every signed-in dashboard
  *                              user gets the Gemini AI analysis features
  *                              wired up automatically without pasting their
@@ -83,6 +94,56 @@ if (!DASHBOARD_PASSWORD) {
 function authEnabled() { return !!DASHBOARD_PASSWORD; }
 function authSecret()  { return DASHBOARD_PASSWORD; }
 function verifyPassword(input) { return safeEq(input, DASHBOARD_PASSWORD); }
+
+// ---------------- WORKSPACES ----------------
+// Multi-account support. Each workspace is one ad account + one creative-links
+// sheet. Configured via the WORKSPACES env var (JSON array). If WORKSPACES
+// isn't set, we synthesize a single workspace from the legacy env vars so
+// existing single-account deployments keep working unchanged.
+let _workspaceCache = null;
+function getWorkspaces() {
+  if (_workspaceCache) return _workspaceCache;
+  const raw = (process.env.WORKSPACES || '').trim();
+  let parsed = null;
+  if (raw) {
+    try { parsed = JSON.parse(raw); }
+    catch (e) {
+      console.error('\n  ✗  WORKSPACES env var is not valid JSON: ' + e.message + '\n');
+    }
+  }
+  if (Array.isArray(parsed) && parsed.length) {
+    _workspaceCache = parsed
+      .filter(w => w && typeof w === 'object' && w.id && w.ad_account)
+      .map(w => ({
+        id:           String(w.id).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 40),
+        label:        String(w.label || w.id),
+        ad_account:   String(w.ad_account),
+        campaign_ids: String(w.campaign_ids || '').trim(),
+        sheet_id:     String(w.sheet_id || '').trim()
+      }))
+      .filter(w => w.id);
+  } else {
+    // Legacy single-workspace fallback. Uses META_AD_ACCOUNT etc.
+    _workspaceCache = [{
+      id:           'default',
+      label:        'Dashboard',
+      ad_account:   process.env.META_AD_ACCOUNT || '',
+      campaign_ids: process.env.META_CAMPAIGN_IDS || '',
+      sheet_id:     '' // legacy mode uses LINKS_CSV_URL on the client side
+    }];
+  }
+  return _workspaceCache;
+}
+function getWorkspace(id) {
+  const list = getWorkspaces();
+  if (!id) return list[0];
+  return list.find(w => w.id === id) || list[0];
+}
+// Public summary for the client — never includes the sheet id (privacy) or
+// campaign ids (operational detail). Just enough to render the tab strip.
+function publicWorkspaces() {
+  return getWorkspaces().map(w => ({ id: w.id, label: w.label }));
+}
 
 // ---------------- SECURITY HEADERS ----------------
 app.use((req, res, next) => {
@@ -232,13 +293,17 @@ app.use('/api', requireAuth);
 
 // ---------------- /config.json (browser runtime config) ----------------
 app.get('/config.json', (req, res) => {
-  const hasMetaApi = !!(process.env.META_TOKEN && process.env.META_AD_ACCOUNT);
+  const workspaces = publicWorkspaces();
+  // The Meta API is "available" if a token is set AND we have at least one
+  // workspace with an ad account configured.
+  const hasMetaApi = !!(process.env.META_TOKEN && getWorkspaces().some(w => w.ad_account));
   res.set('Cache-Control', 'no-store');
   res.json({
     metaCsvUrl:        process.env.META_CSV_URL  || '',
     linksCsvUrl:       process.env.LINKS_CSV_URL || '',
     driveApiKey:       process.env.DRIVE_API_KEY || '',
     metaApiUrl:        hasMetaApi ? '/api/meta-insights.csv' : '',
+    workspaces:        workspaces,
     // When true, the dashboard routes Drive thumbnails + video playback
     // through the server (service-account-backed) instead of hitting the
     // public Drive endpoints. Required for files behind a "sign-in
@@ -373,15 +438,105 @@ app.get('/api/drive-thumbnail', async (req, res) => {
   }
 });
 
+// ---------------- Per-workspace creative links (server-side sheet read) ----------------
+// Reads the workspace's links sheet directly via the service account and
+// returns one merged "Ad Name,Link" CSV that the existing parseLinkCSV()
+// on the client already understands. Replaces the legacy Apps-Script proxy
+// approach — each workspace just needs its sheet shared with the SA, no
+// per-sheet Apps Script deployment required.
+//
+// Caches the rendered CSV in memory for 5 minutes per workspace because:
+//   - sheet reads cost ~1-2s per workspace, and the dashboard polls hourly
+//   - sheet contents change rarely (people add rows occasionally, not bursts)
+//   - bypassed by /api/links.csv?fresh=1 if the user clicks Refresh
+const _linksCsvCache = new Map(); // workspace.id -> { csv, expiresAt }
+const LINKS_CSV_TTL_MS = 5 * 60 * 1000;
+
+app.get('/api/links.csv', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const ws = getWorkspace(req.query.workspace);
+  if (!ws.sheet_id) {
+    return res.status(503).type('text/plain')
+      .send('No links sheet configured for this workspace.');
+  }
+  if (!hasDriveSA()) {
+    return res.status(503).type('text/plain')
+      .send('Server-side sheet read requires GOOGLE_CREDENTIALS_JSON.');
+  }
+  const cacheKey = ws.id + ':' + ws.sheet_id;
+  if (!req.query.fresh) {
+    const c = _linksCsvCache.get(cacheKey);
+    if (c && c.expiresAt > Date.now()) {
+      res.type('text/csv').send(c.csv);
+      return;
+    }
+  }
+  try {
+    const csv = await readLinksFromSheet(ws.sheet_id);
+    _linksCsvCache.set(cacheKey, { csv, expiresAt: Date.now() + LINKS_CSV_TTL_MS });
+    res.type('text/csv').send(csv);
+  } catch (err) {
+    const msg = (err.errors && err.errors[0] && err.errors[0].message) || err.message || 'unknown';
+    res.status(502).type('text/plain').send('Sheet read failed: ' + msg);
+  }
+});
+
+// Walk every tab in the sheet, find the ones with Ad Name + Link columns,
+// merge into a single dedup'd CSV. Last occurrence wins so the most recent
+// month's link takes precedence over older months.
+async function readLinksFromSheet(sheetId) {
+  const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: sheetId,
+    fields: 'sheets.properties.title'
+  });
+  const tabNames = (meta.data.sheets || []).map(s => s.properties && s.properties.title).filter(Boolean);
+
+  const dedup = new Map();
+  for (const tab of tabNames) {
+    let rows;
+    try {
+      const got = await sheets.spreadsheets.values.get({
+        spreadsheetId: sheetId,
+        range: `'${tab.replace(/'/g, "''")}'!A:Z`
+      });
+      rows = got.data.values || [];
+    } catch (_) { continue; }
+    if (rows.length < 2) continue;
+    const headers = rows[0].map(h => String(h || '').toLowerCase().replace(/[^a-z0-9 ]/g, '').trim());
+    let nameCol = -1, linkCol = -1;
+    headers.forEach((h, i) => {
+      if (nameCol === -1 && (h.includes('ad name') || h === 'name' || h === 'ad' || h.includes('creative name') || h === 'creative')) nameCol = i;
+      if (linkCol === -1 && (h.includes('drive') || h.includes('link') || h.includes('url') || h.includes('video'))) linkCol = i;
+    });
+    if (nameCol === -1 || linkCol === -1) continue;
+    for (let i = 1; i < rows.length; i++) {
+      const r = rows[i] || [];
+      const name = String(r[nameCol] || '').replace(/\s+/g, ' ').trim();
+      const link = String(r[linkCol] || '').trim();
+      if (!name || !link) continue;
+      if (!/^https?:\/\//i.test(link)) continue;
+      dedup.set(name.toLowerCase(), { name, link });
+    }
+  }
+  const lines = ['Ad Name,Link'];
+  for (const v of dedup.values()) lines.push(csvField(v.name) + ',' + csvField(v.link));
+  return lines.join('\r\n');
+}
+
 // ---------------- Analysis history (Google Sheets persistence) ----------------
 // Every completed AI analysis is appended to a "Analysis Log" tab on the
 // configured sheet. The tab is created lazily on first write. Used by the
 // client to (a) render instantly when re-opening a previously analyzed ad
 // and (b) inject "past winners' patterns" into new analysis prompts.
 const ANALYSIS_TAB = 'Analysis Log';
+// Column J (workspace_id) was added so multi-workspace dashboards can keep
+// each account's winners isolated. Rows from before this column existed
+// will have an empty column J — they get treated as the legacy "default"
+// workspace and won't appear in any non-default workspace's queries.
 const ANALYSIS_HEADERS = [
   'created_at', 'ad_id', 'ad_name', 'normalized_name',
-  'score', 'metrics_json', 'snapshot', 'provider', 'model'
+  'score', 'metrics_json', 'snapshot', 'provider', 'model', 'workspace_id'
 ];
 let _analysisTabReady = false; // module-level cache — only do the existence check once
 
@@ -413,7 +568,7 @@ async function ensureAnalysisTab() {
     });
     await sheets.spreadsheets.values.update({
       spreadsheetId: sheetId,
-      range: `${ANALYSIS_TAB}!A1:I1`,
+      range: `${ANALYSIS_TAB}!A1:J1`,
       valueInputOption: 'RAW',
       requestBody: { values: [ANALYSIS_HEADERS] }
     });
@@ -461,6 +616,7 @@ app.post('/api/save-analysis', async (req, res) => {
   try {
     await ensureAnalysisTab();
     const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const ws = getWorkspace(b.workspace);
     const row = [
       new Date().toISOString(),
       adId,
@@ -470,11 +626,12 @@ app.post('/api/save-analysis', async (req, res) => {
       JSON.stringify(b.metrics || {}),
       snapshot,
       String(b.provider || ''),
-      String(b.model || '')
+      String(b.model || ''),
+      ws.id
     ];
     await sheets.spreadsheets.values.append({
       spreadsheetId: process.env.ANALYSIS_SHEET_ID,
-      range: `${ANALYSIS_TAB}!A:I`,
+      range: `${ANALYSIS_TAB}!A:J`,
       valueInputOption: 'RAW',
       insertDataOption: 'INSERT_ROWS',
       requestBody: { values: [row] }
@@ -498,22 +655,26 @@ app.get('/api/analysis-for-ad', async (req, res) => {
     const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.ANALYSIS_SHEET_ID,
-      range: `${ANALYSIS_TAB}!A:I`
+      range: `${ANALYSIS_TAB}!A:J`
     });
     const rows = result.data.values || [];
+    const ws = getWorkspace(req.query.workspace);
     for (let i = rows.length - 1; i >= 1; i--) {
-      if (rows[i] && rows[i][1] === adId) {
-        return res.json({
-          found: true,
-          created_at: rows[i][0] || '',
-          ad_name: rows[i][2] || '',
-          score: rows[i][4] || '',
-          metrics: tryParseJSON(rows[i][5]) || {},
-          snapshot: rows[i][6] || '',
-          provider: rows[i][7] || '',
-          model: rows[i][8] || ''
-        });
-      }
+      if (!rows[i] || rows[i][1] !== adId) continue;
+      // Workspace match: an empty column J = legacy row, matches only the
+      // 'default' workspace. Explicit values must match exactly.
+      const rowWs = (rows[i][9] || 'default').toLowerCase();
+      if (rowWs !== ws.id.toLowerCase()) continue;
+      return res.json({
+        found: true,
+        created_at: rows[i][0] || '',
+        ad_name: rows[i][2] || '',
+        score: rows[i][4] || '',
+        metrics: tryParseJSON(rows[i][5]) || {},
+        snapshot: rows[i][6] || '',
+        provider: rows[i][7] || '',
+        model: rows[i][8] || ''
+      });
     }
     res.json({ found: false });
   } catch (err) {
@@ -532,11 +693,14 @@ app.get('/api/recent-winners', async (req, res) => {
     const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
     const result = await sheets.spreadsheets.values.get({
       spreadsheetId: process.env.ANALYSIS_SHEET_ID,
-      range: `${ANALYSIS_TAB}!A:I`
+      range: `${ANALYSIS_TAB}!A:J`
     });
     const rows = result.data.values || [];
+    const ws = getWorkspace(req.query.workspace);
     const winners = [];
     for (let i = rows.length - 1; i >= 1 && winners.length < limit * 4; i--) {
+      const rowWs = (rows[i][9] || 'default').toLowerCase();
+      if (rowWs !== ws.id.toLowerCase()) continue;
       const metrics = tryParseJSON(rows[i][5]) || {};
       const cpi = parseFloat(metrics.cpi);
       // CPI gate: only proven low-cost ads count as "winners" worth
@@ -564,12 +728,12 @@ function tryParseJSON(s) {
 // ---------------- Meta API: connection test ----------------
 app.get('/api/ad-metrics', async (req, res) => {
   const token = process.env.META_TOKEN;
-  const account = process.env.META_AD_ACCOUNT;
-  if (!token || !account) {
-    return res.status(503).json({ error: 'Set META_TOKEN and META_AD_ACCOUNT env vars.' });
+  const ws = getWorkspace(req.query.workspace);
+  if (!token || !ws.ad_account) {
+    return res.status(503).json({ error: 'Workspace not configured (need META_TOKEN + ad_account).' });
   }
   const datePreset = sanitizeDatePreset(req.query.date_preset || process.env.META_DATE_PRESET);
-  const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(account)}/insights` +
+  const url = `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
               `?fields=spend,impressions,clicks,ctr` +
               `&date_preset=${encodeURIComponent(datePreset)}` +
               `&access_token=${encodeURIComponent(token)}`;
@@ -727,10 +891,10 @@ function extractThumbnail(creative) {
 // ---------------- Meta API: full ad-level insights as CSV ----------------
 app.get('/api/meta-insights.csv', async (req, res) => {
   const token = process.env.META_TOKEN;
-  const account = process.env.META_AD_ACCOUNT;
-  if (!token || !account) {
+  const ws = getWorkspace(req.query.workspace);
+  if (!token || !ws.ad_account) {
     return res.status(503).type('text/plain')
-      .send('Meta API not configured: set META_TOKEN and META_AD_ACCOUNT env vars.');
+      .send('Workspace not configured: set META_TOKEN and a workspace ad_account.');
   }
   const datePreset = sanitizeDatePreset(req.query.date_preset || process.env.META_DATE_PRESET);
   const fields = [
@@ -742,7 +906,9 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     'date_start','date_stop'
   ].join(',');
 
-  const campaignIdsRaw = (req.query.campaign_ids || process.env.META_CAMPAIGN_IDS || '').trim();
+  // Per-request override > workspace default. Either way, only digit-shaped
+  // ids pass the regex, so injection through the filter param is blocked.
+  const campaignIdsRaw = (req.query.campaign_ids || ws.campaign_ids || '').trim();
   const campaignIds = campaignIdsRaw
     ? campaignIdsRaw.split(',').map(s => s.trim()).filter(s => /^\d{1,30}$/.test(s))
     : [];
@@ -753,7 +919,7 @@ app.get('/api/meta-insights.csv', async (req, res) => {
   }
 
   const firstUrl =
-    `https://graph.facebook.com/v21.0/${encodeURIComponent(account)}/insights` +
+    `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
     `?level=ad&fields=${fields}` +
     `&date_preset=${encodeURIComponent(datePreset)}` +
     filteringParam +
