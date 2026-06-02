@@ -24,7 +24,9 @@
  *                                  "campaign_ids":      "120243586878400130",      // optional
  *                                  "sheet_id":          "18__KDrig...",            // links sheet id
  *                                  "workflow_sheet_id": "1m3dNzNZ...",             // optional — for + Workflow rows
- *                                  "workflow_tab":      "Variation-foreign"        // optional — tab name within that sheet
+ *                                  "workflow_tab":      "Variation-foreign",       // optional — tab name within that sheet
+ *                                  "data_sheet_id":     "AB123...",                // optional — pre-synced ad data store
+ *                                  "data_tab":          "foreign"                  // optional — tab name within that sheet
  *                                }
  *                              If unset, the server falls back to a single
  *                              workspace built from the legacy env vars below.
@@ -129,7 +131,13 @@ function getWorkspaces() {
         // "+ Workflow" submission for this workspace lands here automatically
         // (no per-user webhook setup needed).
         workflow_sheet_id: String(w.workflow_sheet_id || '').trim(),
-        workflow_tab:      String(w.workflow_tab || '').trim()
+        workflow_tab:      String(w.workflow_tab || '').trim(),
+        // Optional — pre-synced ad data store. When set, /api/meta-insights.csv
+        // reads from this sheet (instant) instead of hitting Meta live every
+        // time. Sync runs via /api/sync-meta-data (manual or auto-triggered
+        // when the sheet is older than 24h).
+        data_sheet_id:     String(w.data_sheet_id || '').trim(),
+        data_tab:          String(w.data_tab || '').trim()
       }))
       .filter(w => w.id);
   } else {
@@ -1025,6 +1033,36 @@ app.get('/api/meta-insights.csv', async (req, res) => {
       res.type('text/csv').send(hit.csv);
       return;
     }
+    // Data-store path: when the workspace has a sheet-backed cache set up,
+    // serve from it instead of going to Meta. Sheet read is ~1-2s vs the
+    // 10-30s Meta pagination walk, so even a cold-start dashboard load
+    // feels fast. If the sheet is older than 24h, kick off a background
+    // sync that doesn't block this response — the user sees yesterday's
+    // numbers immediately, the freshening happens in the background, and
+    // tomorrow's first visit gets the new ones.
+    if (ws.data_sheet_id && ws.data_tab && hasDriveSA()) {
+      try {
+        const csv = await readMetaDataSheet(ws);
+        if (csv && csv.split('\n').length >= 2) { // header + at least one row
+          let lastModified = 0;
+          try { lastModified = await getSheetLastModified(ws.data_sheet_id); } catch (_) {}
+          const ageMs = lastModified ? Date.now() - lastModified : Infinity;
+          if (ageMs > DATA_SHEET_STALE_MS) triggerBackgroundSync(ws, token);
+          _insightsCache.set(cacheKey, {
+            csv,
+            effectivePreset: datePreset,
+            expiresAt: Date.now() + INSIGHTS_CACHE_TTL_MS
+          });
+          res.set('Cache-Control', 'no-store');
+          res.set('X-Requested-Date-Preset', datePreset);
+          res.set('X-Effective-Date-Preset', datePreset);
+          res.set('X-Cache', 'SHEET');
+          res.set('X-Sheet-Age-Seconds', String(Math.round(ageMs / 1000)));
+          res.type('text/csv').send(csv);
+          return;
+        }
+      } catch (_) { /* fall through to live Meta */ }
+    }
   }
   const fields = [
     'ad_id','ad_name','adset_name','campaign_id','campaign_name',
@@ -1306,6 +1344,274 @@ function num(v) { const n = parseFloat(v); return isNaN(n) ? 0 : n; }
 function csvField(s) {
   s = String(s == null ? '' : s);
   return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// ---------------- Data store sync (sheet-backed insights) ----------------
+// When a workspace has data_sheet_id + data_tab configured, the dashboard
+// reads from that sheet instead of going to Meta on every load. Sync is
+// triggered by POST /api/sync-meta-data, or automatically in the background
+// when /api/meta-insights.csv sees the sheet is older than the threshold.
+//
+// Why this exists: cold-start dashboard loads were slow because they had
+// to walk Meta's pagination + cascade-fallback for every visit. With the
+// sheet as a persistent cache, even the first visit of the day reads
+// instantly; the freshness pass runs in background and doesn't block.
+
+// Built from buildInsightsCSV but returns array-of-arrays instead of CSV
+// text — that's the shape Google Sheets API wants for writes. The existing
+// buildInsightsCSV is preserved for any callers that need the raw CSV.
+function buildInsightsRows(rows, createdTimes) {
+  const header = [
+    'Ad ID','Ad Name','Campaign','Campaign ID','Ad Set','Date',
+    'Spend','Impressions','Reach','Frequency',
+    'Clicks','CTR','CPM','CPC',
+    'Installs','CPI','Hook Rate','Hold Rate','CTI'
+  ];
+  const out = [header];
+  for (const row of rows) {
+    const actions    = actionsToMap(row.actions);
+    const costPer    = actionsToMap(row.cost_per_action_type);
+    const thruplay   = actionsToMap(row.video_thruplay_watched_actions);
+    const spend       = num(row.spend);
+    const impressions = num(row.impressions);
+    const installs    = num(actions.mobile_app_install)
+                      || num(actions.app_install)
+                      || num(actions.omni_app_install);
+    const clicks      = num(row.inline_link_clicks) || num(row.clicks);
+    const threeSecV   = num(actions.video_view);
+    const thruplayV   = num(thruplay.video_view);
+    let cpi = '';
+    if (installs > 0 && spend > 0) cpi = (spend / installs).toFixed(2);
+    else if (costPer.mobile_app_install) cpi = num(costPer.mobile_app_install).toFixed(2);
+    const hookRate = impressions > 0 && threeSecV > 0
+      ? ((threeSecV / impressions) * 100).toFixed(2) : '';
+    const holdRate = threeSecV > 0 && thruplayV > 0
+      ? ((thruplayV / threeSecV) * 100).toFixed(2) : '';
+    const cti = clicks > 0 && installs > 0
+      ? ((installs / clicks) * 100).toFixed(2) : '';
+    out.push([
+      String(row.ad_id || ''),
+      String(row.ad_name || ''),
+      String(row.campaign_name || ''),
+      String(row.campaign_id || ''),
+      String(row.adset_name || ''),
+      String((createdTimes && createdTimes.get(row.ad_id)) || row.date_start || ''),
+      String(row.spend || ''),
+      String(row.impressions || ''),
+      String(row.reach || ''),
+      String(row.frequency || ''),
+      String(clicks || ''),
+      String(row.ctr || ''),
+      String(row.cpm || ''),
+      String(row.cpc || ''),
+      String(installs || ''),
+      String(cpi),
+      String(hookRate),
+      String(holdRate),
+      String(cti)
+    ]);
+  }
+  return out;
+}
+
+// Convert a 2D array of cell values back into a CSV string — used to
+// translate sheet rows into the same CSV the dashboard parser already
+// understands. Note: every cell goes through csvField so commas/quotes
+// inside ad names get properly escaped on read-back too.
+function arrayToCSV(arr) {
+  return arr.map(r => r.map(csvField).join(',')).join('\n');
+}
+
+// How old a sheet can be before we trigger an auto background sync.
+// 24h matches a reasonable "daily refresh" rhythm — sheet stays usable
+// for most of the workday, even if someone forgets to hit the manual
+// sync.
+const DATA_SHEET_STALE_MS = 24 * 60 * 60 * 1000;
+const _bgSyncInflight = new Set(); // workspace ids currently being synced
+
+async function getSheetLastModified(sheetId) {
+  const drive = getGoogle().drive({ version: 'v3', auth: getDriveAuth() });
+  const r = await drive.files.get({
+    fileId: sheetId,
+    fields: 'modifiedTime',
+    supportsAllDrives: true
+  });
+  return r.data && r.data.modifiedTime ? new Date(r.data.modifiedTime).getTime() : 0;
+}
+
+async function readMetaDataSheet(ws) {
+  const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+  const range = `'${ws.data_tab.replace(/'/g, "''")}'!A:Z`;
+  const result = await sheets.spreadsheets.values.get({
+    spreadsheetId: ws.data_sheet_id,
+    range
+  });
+  const arr = result.data.values || [];
+  if (arr.length === 0) return '';
+  return arrayToCSV(arr);
+}
+
+async function writeMetaDataSheet(ws, rowsArray) {
+  const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+  const range = `'${ws.data_tab.replace(/'/g, "''")}'`;
+  // Two-step: clear everything in the tab, then write header + rows.
+  // We don't try to upsert because every row's metrics change on every
+  // sync anyway — incremental would still touch every row, so the
+  // simpler full-rewrite is no slower in practice.
+  await sheets.spreadsheets.values.clear({
+    spreadsheetId: ws.data_sheet_id,
+    range: range + '!A:Z'
+  });
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: ws.data_sheet_id,
+    range: range + '!A1',
+    valueInputOption: 'RAW',
+    requestBody: { values: rowsArray }
+  });
+}
+
+// Same cascade + pagination logic as /api/meta-insights.csv but returns
+// the data structures directly so the sync endpoint can re-use it.
+// Throws { status, message } on a hard failure the caller should surface.
+async function fetchInsightsFromMeta(ws, token, datePresetReq, campaignIdsRawOverride) {
+  const fields = [
+    'ad_id','ad_name','adset_name','campaign_id','campaign_name',
+    'spend','impressions','reach','frequency',
+    'clicks','inline_link_clicks','ctr','cpm','cpc',
+    'actions','cost_per_action_type',
+    'video_thruplay_watched_actions',
+    'date_start','date_stop'
+  ].join(',');
+
+  const campaignIdsRaw = (campaignIdsRawOverride != null ? campaignIdsRawOverride : ws.campaign_ids || '').trim();
+  const campaignIds = campaignIdsRaw
+    ? campaignIdsRaw.split(',').map(s => s.trim()).filter(s => /^\d{1,30}$/.test(s))
+    : [];
+  let filteringParam = '';
+  if (campaignIds.length) {
+    const filter = [{ field: 'campaign.id', operator: 'IN', value: campaignIds }];
+    filteringParam = `&filtering=${encodeURIComponent(JSON.stringify(filter))}`;
+  }
+
+  const PRESET_CASCADE = ['maximum', 'last_year', 'last_90d', 'last_60d', 'last_30d', 'last_14d', 'last_7d'];
+  const startAt = PRESET_CASCADE.indexOf(datePresetReq);
+  const cascade = startAt >= 0 ? PRESET_CASCADE.slice(startAt) : [datePresetReq, 'last_30d', 'last_7d'];
+
+  // Sync endpoint gets a generous budget — it's a background batch job,
+  // not a user-blocking request. Live /api/meta-insights.csv keeps the
+  // tighter 45s budget it had before.
+  const CASCADE_DEADLINE_MS = 90_000;
+  const PER_FETCH_TIMEOUT_MS = 25_000;
+  const cascadeStart = Date.now();
+  const overBudget = () => Date.now() - cascadeStart > CASCADE_DEADLINE_MS;
+
+  let effectivePreset = null;
+  let rows = [];
+  let lastError = null;
+
+  for (const preset of cascade) {
+    if (overBudget()) { lastError = { message: 'budget exhausted' }; break; }
+    rows = [];
+    let nextUrl =
+      `https://graph.facebook.com/v21.0/${encodeURIComponent(ws.ad_account)}/insights` +
+      `?level=ad&fields=${fields}` +
+      `&date_preset=${encodeURIComponent(preset)}` +
+      filteringParam +
+      `&limit=500&access_token=${encodeURIComponent(token)}`;
+    let pageOk = true;
+    try {
+      for (let page = 0; nextUrl && page < 50; page++) {
+        if (overBudget()) { lastError = { message: 'budget exhausted mid-page' }; pageOk = false; break; }
+        const r = await fetchWithTimeout(nextUrl, {}, PER_FETCH_TIMEOUT_MS);
+        const data = await r.json();
+        if (!r.ok || data.error) {
+          lastError = data.error || { message: 'HTTP ' + r.status, code: null };
+          const isTooMuch =
+            lastError.code === 1 ||
+            (lastError.code === 100 && /reduce.*amount.*data/i.test(lastError.message || '')) ||
+            /please reduce the amount of data/i.test(lastError.message || '');
+          if (isTooMuch && preset !== cascade[cascade.length - 1]) { pageOk = false; break; }
+          throw new Error('Meta API error: ' + lastError.message + (lastError.code != null ? ' (code ' + lastError.code + ')' : ''));
+        }
+        if (Array.isArray(data.data)) rows.push(...data.data);
+        const rawNext = data.paging && data.paging.next ? data.paging.next : null;
+        nextUrl = isSafeMetaUrl(rawNext) ? rawNext : null;
+      }
+    } catch (err) {
+      if (/Meta API error/.test(err.message || '')) throw err; // hard error
+      lastError = { message: err.message || String(err), code: null };
+      pageOk = false;
+    }
+    if (pageOk) { effectivePreset = preset; break; }
+  }
+
+  if (effectivePreset == null) {
+    throw new Error('Cascade exhausted. Last error: ' + (lastError && lastError.message ? lastError.message : 'unknown'));
+  }
+
+  const adIds = Array.from(new Set(rows.map(r => r.ad_id).filter(Boolean)));
+  const createdTimes = await fetchCreatedTimes(adIds, token);
+
+  return { rows, createdTimes, effectivePreset };
+}
+
+// POST /api/sync-meta-data?workspace=X
+// Pulls fresh insights from Meta and overwrites the workspace's data tab.
+// Subsequent dashboard loads read from that tab instead of going to Meta,
+// so even cold-start visits are fast.
+app.post('/api/sync-meta-data', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const token = process.env.META_TOKEN;
+  const ws = getWorkspace(req.query.workspace);
+  if (!token || !ws.ad_account) return res.status(503).json({ ok: false, error: 'META_TOKEN / ad_account missing' });
+  if (!ws.data_sheet_id || !ws.data_tab) {
+    return res.status(503).json({ ok: false, error: 'data_sheet_id + data_tab not configured for workspace "' + ws.id + '". Add them to WORKSPACES.' });
+  }
+  if (!hasDriveSA()) return res.status(503).json({ ok: false, error: 'GOOGLE_CREDENTIALS_JSON not set' });
+  try {
+    const datePreset = sanitizeDatePreset(process.env.META_DATE_PRESET);
+    const { rows, createdTimes, effectivePreset } = await fetchInsightsFromMeta(ws, token, datePreset);
+    const arr = buildInsightsRows(rows, createdTimes);
+    await writeMetaDataSheet(ws, arr);
+    // Invalidate the in-memory cache for this workspace so the next
+    // dashboard load picks up the fresh data immediately.
+    for (const key of _insightsCache.keys()) {
+      if (key.startsWith(ws.id + '|')) _insightsCache.delete(key);
+    }
+    res.json({
+      ok: true,
+      workspace: ws.id,
+      rows_written: arr.length - 1,
+      effective_preset: effectivePreset,
+      synced_at: new Date().toISOString()
+    });
+  } catch (err) {
+    res.status(502).json({ ok: false, error: err.message || String(err) });
+  }
+});
+
+// Fire-and-forget version used when /api/meta-insights.csv sees a stale
+// sheet. We don't await it — the user gets the (stale-but-usable) data
+// immediately and the sync happens in the background. Next refresh
+// picks up the new rows.
+function triggerBackgroundSync(ws, token) {
+  if (!ws || !ws.data_sheet_id || !ws.data_tab) return;
+  if (_bgSyncInflight.has(ws.id)) return;
+  _bgSyncInflight.add(ws.id);
+  (async () => {
+    try {
+      const datePreset = sanitizeDatePreset(process.env.META_DATE_PRESET);
+      const { rows, createdTimes } = await fetchInsightsFromMeta(ws, token, datePreset);
+      const arr = buildInsightsRows(rows, createdTimes);
+      await writeMetaDataSheet(ws, arr);
+      // Drop in-memory cache for this workspace so the next visit reads
+      // the freshly-written sheet rather than the stale memory copy.
+      for (const key of _insightsCache.keys()) {
+        if (key.startsWith(ws.id + '|')) _insightsCache.delete(key);
+      }
+    } catch (_) { /* best-effort; never bubbles to user */ }
+    finally { _bgSyncInflight.delete(ws.id); }
+  })();
 }
 
 // ---------------- Static: only the dashboard HTML ----------------
