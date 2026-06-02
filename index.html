@@ -1202,7 +1202,11 @@ function renderWorkspaceTabs() {
 // Refreshing manually (↻ Refresh data) bypasses the snapshot for the
 // current workspace — clears it so the next switch will go fetch again.
 const _workspaceSnapshots = new Map();
-const WORKSPACE_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 min
+// 3 hours. Long enough that "I tabbed away to do other work and came back"
+// still hits cache, short enough that we never show day-stale numbers
+// without the user explicitly asking. Manual ↻ Refresh data always
+// bypasses regardless of age.
+const WORKSPACE_SNAPSHOT_TTL_MS = 3 * 60 * 60 * 1000;
 
 function _snapshotCurrentWorkspace() {
   if (!currentWorkspaceId || !metaCSVLoaded || !allAds.length) return;

@@ -989,12 +989,13 @@ function extractThumbnail(creative) {
 }
 
 // ---------------- Meta API: full ad-level insights as CSV ----------------
-// Cached per (workspace, date_preset, campaign filter) for 10 minutes.
+// Cached per (workspace, date_preset, campaign filter) for 3 hours.
 // Bypassed when the client sends ?fresh=1 (the manual "↻ Refresh data"
-// button does this). Multiple users hitting Lumus at the same time of day
-// pay the Meta cost once.
+// button does this). Multiple users hitting the same workspace within the
+// window all share one Meta fetch; Refresh forces a fresh pull when
+// someone actually wants up-to-the-minute numbers.
 const _insightsCache = new Map();
-const INSIGHTS_CACHE_TTL_MS = 10 * 60 * 1000;
+const INSIGHTS_CACHE_TTL_MS = 3 * 60 * 60 * 1000;
 
 setInterval(() => {
   const now = Date.now();
