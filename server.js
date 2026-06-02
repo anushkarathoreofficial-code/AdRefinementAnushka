@@ -823,6 +823,86 @@ app.post('/api/workflow-push', async (req, res) => {
   }
 });
 
+// ---------------- Workflow sheet — read pending variations ----------------
+// Returns in-progress rows from the workspace's workflow sheet so every user
+// (regardless of device/browser) sees the same pending variations in the
+// Variations panel. A row is "pending" when Status (col F) is not "Cancelled"
+// and Date done (col L) is empty.
+//
+// Row layout (matches /api/workflow-push):
+//   A Date | B Idea Num | C Ad Name | D Script By | E V | F Status |
+//   G Editor | H reserved | I Platform | J Variation | K Drive link | L Date done
+app.get('/api/workflow-pending', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasDriveSA()) return res.json({ rows: [] });
+  const ws = getWorkspace(req.query.workspace);
+  if (!ws.workflow_sheet_id || !ws.workflow_tab) return res.json({ rows: [] });
+  try {
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    const result = await sheets.spreadsheets.values.get({
+      spreadsheetId: ws.workflow_sheet_id,
+      range: `'${ws.workflow_tab.replace(/'/g, "''")}'!A:L`
+    });
+    const allRows = result.data.values || [];
+    const pending = [];
+    for (let i = 1; i < allRows.length; i++) { // row 0 is header
+      const r = allRows[i] || [];
+      const status   = String(r[5]  || '').trim().toLowerCase(); // F
+      const dateDone = String(r[11] || '').trim();               // L
+      if (dateDone) continue;                       // completed
+      if (status === 'cancelled' || status === 'deleted') continue;
+      const adName = String(r[2] || '').trim();
+      const varNum = String(r[4] || '').trim();
+      if (!adName || !varNum) continue;
+      pending.push({
+        rowIndex:     i + 1,      // 1-based sheet row (row 1 = header)
+        date:         r[0]  || '',
+        ideaNum:      r[1]  || '',
+        adName,
+        scriptBy:     r[3]  || '',
+        variationNum: varNum,
+        status:       r[5]  || '',
+        editor:       r[6]  || '',
+        platform:     r[8]  || '',
+        text:         r[9]  || '',
+        driveLink:    r[10] || ''
+      });
+    }
+    res.json({ rows: pending });
+  } catch (err) {
+    // Non-fatal — dashboard degrades to localStorage-only if sheet is
+    // unreachable (SA permissions missing, sheet misconfigured, etc.)
+    res.json({ rows: [] });
+  }
+});
+
+// Mark a workflow row as "Cancelled" so it disappears from every user's
+// pending list on the next load. We update in-place rather than deleting
+// the row so existing row numbers (used by other clients) stay stable.
+app.post('/api/workflow-cancel-row', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!hasDriveSA()) return res.status(503).json({ ok: false, error: 'GOOGLE_CREDENTIALS_JSON not set' });
+  const ws = getWorkspace(req.query.workspace);
+  if (!ws.workflow_sheet_id || !ws.workflow_tab) {
+    return res.status(503).json({ ok: false, error: 'Workflow sheet not configured for workspace "' + ws.id + '"' });
+  }
+  const rowNum = parseInt(req.body && req.body.row, 10);
+  if (!rowNum || rowNum < 2) return res.status(400).json({ ok: false, error: 'invalid row number' });
+  try {
+    const sheets = getGoogle().sheets({ version: 'v4', auth: getSheetsAuth() });
+    await sheets.spreadsheets.values.update({
+      spreadsheetId:    ws.workflow_sheet_id,
+      range:            `'${ws.workflow_tab.replace(/'/g, "''")}'!F${rowNum}`,
+      valueInputOption: 'RAW',
+      requestBody:      { values: [['Cancelled']] }
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    const msg = (err.errors && err.errors[0] && err.errors[0].message) || err.message || 'unknown';
+    res.status(502).json({ ok: false, error: 'Sheet update failed: ' + msg });
+  }
+});
+
 // ---------------- Meta API: connection test ----------------
 app.get('/api/ad-metrics', async (req, res) => {
   const token = process.env.META_TOKEN;

@@ -1951,6 +1951,10 @@ async function loadFromBackend() {
 
     launchDashboard();
     updateDataSourceBadge();
+    // Pull pending workflow rows from the sheet in the background so every
+    // user sees the same in-progress variations regardless of device/browser.
+    // Fire-and-forget: doesn't block the render.
+    loadSheetPendingVariations();
     // Creative previews are now resolved lazily — only ads that scroll into
     // view or that the user clicks "Preview" on hit /api/ad-creative. That
     // keeps the initial render instant regardless of ad count and stays
@@ -5634,19 +5638,85 @@ function renameAdForVariation(name, newVarNum) {
   return n + ' - ' + newToken; // no v-marker in original — append one
 }
 
+// Fetch in-progress workflow rows from the sheet and merge into workflowItems
+// so every user — regardless of device or browser — sees the same pending
+// variations. Called fire-and-forget after every dashboard load.
+async function loadSheetPendingVariations() {
+  if (!currentWorkspaceId) return;
+  try {
+    const r = await fetch(withWorkspace('/api/workflow-pending'), {
+      credentials: 'same-origin', cache: 'no-store'
+    });
+    if (!r.ok) return;
+    const { rows } = await r.json();
+    if (!Array.isArray(rows) || !rows.length) return;
+    let changed = false;
+    for (const row of rows) {
+      if (!row.adName || !row.variationNum) continue;
+      let wfIdx = workflowItems.findIndex(w => w.adName === row.adName);
+      if (wfIdx < 0) {
+        workflowItems.push({
+          adName: row.adName,
+          ideaNum: row.ideaNum || '',
+          stage: row.editor ? 'assigned' : 'draft',
+          createdAtLabel: row.date || '',
+          scriptBy: row.scriptBy || '',
+          driveLink: row.driveLink || '',
+          variations: [],
+          attachments: []
+        });
+        wfIdx = workflowItems.length - 1;
+        changed = true;
+      }
+      // Deduplicate: skip if a variation with this sheet row already exists.
+      const already = workflowItems[wfIdx].variations.some(v => v.sheetRow === row.rowIndex);
+      if (!already) {
+        workflowItems[wfIdx].variations.push({
+          variationNum: row.variationNum,
+          text: row.text || '',
+          editor: row.editor || '',
+          platform: row.platform || '',
+          createdAtLabel: row.date || '',
+          author: row.scriptBy || 'Team',
+          sheetRow: row.rowIndex   // used to cancel this row on delete
+        });
+        if (row.editor) workflowItems[wfIdx].stage = 'assigned';
+        changed = true;
+      }
+    }
+    if (changed) {
+      saveWorkflow();
+      renderWorkflow();
+      const c = document.getElementById('modalVariations');
+      if (c && currentModalAdId != null) c.innerHTML = renderVariationsPanel(currentModalAdId);
+    }
+  } catch (_) { /* sheet unreachable — silently degrade to localStorage only */ }
+}
+
 // Delete a single pending variation from the workflow.
 // adName  — the wf.adName key (exact string stored in workflowItems)
 // vIdx    — index within that item's .variations array
-// Removes the variation; if that leaves the item empty, removes the whole item.
-// Re-renders both the variations panel in the open modal and the workflow sidebar.
+// Removes from localStorage; also marks the row Cancelled in the sheet so
+// other users' next load picks up the deletion.
 function deletePendingVariation(adName, vIdx) {
   const wfIdx = workflowItems.findIndex(w => w.adName === adName);
   if (wfIdx < 0) return;
+  const v = workflowItems[wfIdx].variations[vIdx];
+  const sheetRow = v && v.sheetRow;
   workflowItems[wfIdx].variations.splice(vIdx, 1);
   if (workflowItems[wfIdx].variations.length === 0) {
     workflowItems.splice(wfIdx, 1);
   }
   saveWorkflow();
+  // Cancel in the sheet so other users' next load doesn't show it.
+  if (sheetRow && currentWorkspaceId) {
+    fetch(withWorkspace('/api/workflow-cancel-row'), {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ row: sheetRow })
+    }).catch(() => {});
+  }
   const c = document.getElementById('modalVariations');
   if (c && currentModalAdId != null) c.innerHTML = renderVariationsPanel(currentModalAdId);
   renderWorkflow();
@@ -5830,6 +5900,15 @@ async function submitSuggestion(adId) {
     const res = useServerWorkflow
       ? await postWorkflowViaServer(row)
       : await postToSheet(row);
+    // Store the sheet row number on the variation so deletePendingVariation()
+    // can cancel it in the sheet, making the deletion visible to all users.
+    if (res.ok && res.body?.lastRow) {
+      const lastVarIdx = workflowItems[idx].variations.length - 1;
+      if (lastVarIdx >= 0) {
+        workflowItems[idx].variations[lastVarIdx].sheetRow = res.body.lastRow;
+        saveWorkflow();
+      }
+    }
     if (res.ok && res.body?.targetSheet) {
       statusEl.innerHTML = `<span style="color:var(--green);">\u2713 Row appended to "${res.body.targetSheet}"${res.body.lastRow ? ' (row ' + res.body.lastRow + ')' : ''}</span>`;
     } else if (res.ok) {
