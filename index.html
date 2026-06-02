@@ -4171,37 +4171,35 @@ function renderVariationsPanel(seedAdId) {
   // matches+pending empty-check). Reusing it here.
   const pendingRows = [];
   // pendingSeq mirrors how live rows assign sequential badges (V1, V2, V3).
-  // Starts at matches.length so the first pending row always claims the next
-  // position: if 3 live ads exist → pendingSeq starts at 3 → first pending = V4.
-  let pendingSeq = matches.length;
+  // Seed from whichever is higher: live variation count OR the V-number
+  // already in the seed ad's name. This handles the common solo case: a
+  // single "V1 - Main" ad with no live variant group yet would otherwise
+  // start at 0 and show the pending row as V1 instead of V2.
+  let pendingSeq = Math.max(matches.length, _extractAnyVariantNum(seedAd.name));
   for (const wf of workflowItems || []) {
     if (!wf || !Array.isArray(wf.variations) || !wf.variations.length) continue;
     // Match workflow items by normalized name — accommodates "Copy" suffix,
     // emoji prefix, case differences. Same matcher used elsewhere.
     if (normalizeAdName(wf.adName || '') !== seedNorm) continue;
-    for (const v of wf.variations) {
+    for (let vIdx = 0; vIdx < wf.variations.length; vIdx++) {
+      const v = wf.variations[vIdx];
       const vNum = String(v.variationNum || '').trim();
       if (!vNum) continue;
       // Claim the next sequential position for this pending slot.
       pendingSeq++;
       // Skip if a live ad with this exact V-number has already appeared —
       // means the editor delivered and the live version is now in the panel.
-      // Use _extractAnyVariantNum so pipe-format names like
-      // "Mailbox AI | V4 - Cut 4 | ..." are detected correctly.
       const isLive = matches.some(m => _extractAnyVariantNum(m.ad.name) === pendingSeq);
       if (isLive) continue;
-      // Use position-based display number (V4, V5, …) — consistent with how
-      // live rows show sequential V1/V2/V3 badges regardless of the V-marker
-      // embedded in the ad name. This also corrects old workflow items that
-      // were saved with the wrong variationNum before the regex fix.
+      // Use position-based display number (V2, V3, V4, …) — consistent with
+      // how live rows use sequential versionNum not the name-embedded marker.
       const displayVNum = 'v' + pendingSeq;
       const brief = String(v.text || '').replace(/\s+/g, ' ').trim();
       const briefShort = brief.length > 90 ? brief.slice(0, 87) + '…' : brief;
       const editor = v.editor ? ` · ${v.editor}` : '';
-      // Rename the seed ad's name with the correct position-based V-number so
-      // the pending row shows "Mailbox AI | V4 - Cut 3 | ..." — matching what
-      // the sheet row should (and going forward will) contain.
       const displayName = renameAdForVariation(seedAd.name, displayVNum);
+      // Safe JSON-encode the adName for inline onclick — handles quotes/special chars.
+      const safeWfName = JSON.stringify(wf.adName || '');
       pendingRows.push(`<div class="variation-row" style="opacity:.78; border:1px dashed var(--border);" title="In progress — will be replaced when the live ad appears">
         <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${displayVNum.toUpperCase()}</span>
         <div class="var-thumb-placeholder" style="background:var(--surface2); color:var(--text-dim);">⏳</div>
@@ -4209,7 +4207,10 @@ function renderVariationsPanel(seedAdId) {
           <div style="color:var(--text); font-weight:500;">${escHtml(displayName)}</div>
           <div style="font-size:10px; color:var(--text-dim);">In progress${editor} · ${escHtml(briefShort) || 'no brief'}</div>
         </div>
-        <div class="var-metrics"><span style="font-size:10px; color:var(--text-dim); font-style:italic;">pending — no metrics yet</span></div>
+        <div class="var-metrics" style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
+          <span style="font-size:10px; color:var(--text-dim); font-style:italic;">pending — no metrics yet</span>
+          <button onclick="deletePendingVariation(${safeWfName}, ${vIdx}); event.stopPropagation();" style="background:none; border:1px solid var(--border); color:var(--text-dim); border-radius:4px; cursor:pointer; padding:1px 7px; font-size:13px; line-height:1.3; flex-shrink:0;" title="Delete this pending variation">×</button>
+        </div>
       </div>`);
     }
   }
@@ -5631,6 +5632,24 @@ function renameAdForVariation(name, newVarNum) {
   const pat = /\b(v|ver|version)\s*\d+\b/i;
   if (pat.test(n)) return n.replace(pat, newToken);
   return n + ' - ' + newToken; // no v-marker in original — append one
+}
+
+// Delete a single pending variation from the workflow.
+// adName  — the wf.adName key (exact string stored in workflowItems)
+// vIdx    — index within that item's .variations array
+// Removes the variation; if that leaves the item empty, removes the whole item.
+// Re-renders both the variations panel in the open modal and the workflow sidebar.
+function deletePendingVariation(adName, vIdx) {
+  const wfIdx = workflowItems.findIndex(w => w.adName === adName);
+  if (wfIdx < 0) return;
+  workflowItems[wfIdx].variations.splice(vIdx, 1);
+  if (workflowItems[wfIdx].variations.length === 0) {
+    workflowItems.splice(wfIdx, 1);
+  }
+  saveWorkflow();
+  const c = document.getElementById('modalVariations');
+  if (c && currentModalAdId != null) c.innerHTML = renderVariationsPanel(currentModalAdId);
+  renderWorkflow();
 }
 
 function sendToWorkflow(adId) {
