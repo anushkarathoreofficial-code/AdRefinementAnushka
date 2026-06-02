@@ -425,17 +425,6 @@
   .model-select { padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:11px; outline:none; cursor:pointer; }
 
   /* === COLLABORATION / WORKFLOW === */
-  .who-modal-overlay { position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,.8); z-index:200; display:flex; align-items:center; justify-content:center; }
-  .who-modal { background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:32px; width:90%; max-width:420px; text-align:center; }
-  .who-modal h2 { font-size:18px; margin-bottom:6px; }
-  .who-modal p { font-size:12px; color:var(--text-dim); margin-bottom:20px; }
-  .who-select { width:100%; padding:12px; border-radius:8px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:14px; margin-bottom:12px; outline:none; cursor:pointer; }
-  .who-add-row { display:flex; gap:8px; margin-bottom:16px; }
-  .who-add-row input { flex:1; padding:8px 12px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:12px; outline:none; }
-  .who-btn { padding:10px 24px; border-radius:8px; border:none; background:var(--accent); color:#000000; font-size:14px; font-weight:700; cursor:pointer; }
-  .who-btn:disabled { opacity:.4; cursor:not-allowed; }
-  .current-user-bar { padding:6px 32px; max-width:1400px; margin:0 auto; display:flex; align-items:center; justify-content:space-between; font-size:11px; color:var(--text-dim); }
-  .current-user-bar .user-name { color:var(--accent); font-weight:600; }
 
   /* Workflow tab */
   .wf-section { padding:16px 32px 40px; max-width:1400px; margin:0 auto; }
@@ -650,11 +639,6 @@
 <div id="dashboardSection" style="display:none;">
 
 
-  <!-- Current user bar -->
-  <div class="current-user-bar" id="currentUserBar" style="display:none;">
-    <span>Logged in as: <span class="user-name" id="currentUserName"></span></span>
-    <span style="cursor:pointer; color:var(--blue);" onclick="showWhoPicker()">Switch user</span>
-  </div>
 
   <!-- ===== TAB: CREATIVES ===== -->
   <div class="tab-content active" id="tab-creatives">
@@ -970,21 +954,6 @@
   </div>
 </div>
 
-<!-- Who Are You Picker -->
-<div class="who-modal-overlay" id="whoModal">
-  <div class="who-modal">
-    <h2>Welcome to the Dashboard</h2>
-    <p>Select your name or add yourself to the team</p>
-    <select class="who-select" id="whoSelect">
-      <option value="">Choose your name...</option>
-    </select>
-    <div class="who-add-row">
-      <input type="text" id="whoNewName" placeholder="Add new team member name">
-      <button class="btn btn-connect" style="font-size:11px; padding:8px 12px;" onclick="addTeamMember()">Add</button>
-    </div>
-    <button class="who-btn" id="whoContinue" disabled onclick="selectUser()">Continue</button>
-  </div>
-</div>
 
 <script>
 // ============ BACKEND CONFIG ============
@@ -5193,44 +5162,6 @@ function switchMainTab(name) {
   if (name === 'contacts') renderContactsTab();
 }
 
-// ---- Who Picker ----
-// Welcome modal is disabled — currentUser stays empty and call sites fall
-// back to "Team" / "Dashboard". Re-enable by reverting this function.
-function initWhoPicker() {
-  const modal = document.getElementById('whoModal');
-  if (modal) modal.style.display = 'none';
-}
-
-function addTeamMember() {
-  const name = document.getElementById('whoNewName').value.trim();
-  if (!name || teamMembers.includes(name)) return;
-  teamMembers.push(name);
-  saveTeam();
-  document.getElementById('whoNewName').value = '';
-  initWhoPicker();
-  // Auto select the new name
-  document.getElementById('whoSelect').value = name;
-  document.getElementById('whoContinue').disabled = false;
-}
-
-function selectUser() {
-  const name = document.getElementById('whoSelect').value;
-  if (!name) return;
-  currentUser = name;
-  Store.set('current_user', name);
-  document.getElementById('whoModal').style.display = 'none';
-  showUserBar();
-}
-
-function showWhoPicker() {
-  initWhoPicker();
-  document.getElementById('whoModal').style.display = 'flex';
-}
-
-function showUserBar() {
-  document.getElementById('currentUserBar').style.display = 'flex';
-  document.getElementById('currentUserName').textContent = currentUser;
-}
 
 // ---- Video Editor Contacts ----
 function renderEditors() {
@@ -6212,7 +6143,6 @@ ${allVariations}`;
 
 // ---- Init on page load ----
 function initCollaboration() {
-  initWhoPicker();
   renderEditors();
   renderWorkflow();
   loadIntegrationFields();
