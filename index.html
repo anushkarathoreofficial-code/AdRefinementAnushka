@@ -2526,47 +2526,71 @@ function buildDeepAnalysisPrompt(ad, isWin, pastWinners) {
   const failing = Object.keys(ad.failed).filter(k => !isNaN(ad.metrics[k])).map(k => BENCHMARKS[k].label).join(', ') || 'none';
   const passing = Object.keys(ad.passed).map(k => BENCHMARKS[k].label).join(', ') || 'none';
 
-  return `You are a top performance + creative director at Astrotalk (Vedic astrology / love & psychic consultation app \u2014 India, scaling US/UK/EU). You've just watched the full ad. Write a concise, scannable report the video editor can act on tomorrow.
+  return `You are a senior performance creative director at Astrotalk \u2014 a Vedic astrology / love & psychic consultation app, originally India, now scaling US/UK/EU. You have just watched this ad in full. Your job is to tell the editor EXACTLY why this video performed the way it did and give them a specific, prioritised plan to improve it.
 
-Rules:
-- Be OBSERVATIONAL. Name what you actually see and hear, with timestamps. No vague adjectives ("engaging", "compelling", "powerful").
-- Quote dialogue verbatim wherever it matters.
-- Tag every insight with the metric it affects: [Hook] [Hold] [CTI] [CPI] [Brand] [Compliance].
-- Use the headings exactly as below. No preamble. No closing summary.
-- Stay under 350 words total. Drop a section only if there's genuinely nothing to say there.
+RULES (non-negotiable):
+- Every observation needs a timestamp. No timestamp = don't write it.
+- Quote dialogue verbatim. Never paraphrase a script line you can quote directly.
+- No vague adjectives. "Good hook" is banned. "Opens on close-up of hands at 0:00, cuts to face reveal at 0:02 \u2014 pattern interrupt" is allowed.
+- Each fix must name the exact second, the exact change, and the metric it will move.
+- Use the section headings exactly as written below. No preamble. No sign-off.
 
-CONTEXT: ${context}
-METRICS: CPI ${fmtR(m.cpi)} \u00b7 Hook ${fmt(m.hook,'%')} \u00b7 Hold ${fmt(m.hold,'%')} \u00b7 CTI ${fmt(m.cti,'%')} \u00b7 CPM ${fmtR(m.cpm)} \u00b7 Installs ${e.installs || 0} \u00b7 Spend ${fmtR(ad.spend)}
-BENCHMARKS: CPI<\u20b9350 \u00b7 Hook>30% \u00b7 Hold>40% \u00b7 CTI>20% \u00b7 CPM<\u20b91500
-PASSING: ${passing}
-FAILING: ${failing}
+AD METRICS:
+- CPI: ${fmtR(m.cpi)} (benchmark < \u20b9350) ${isNaN(m.cpi) ? '' : m.cpi < 350 ? '\u2713 PASSING' : '\u2717 FAILING'}
+- Hook Rate: ${fmt(m.hook,'%')} (benchmark > 30%) ${isNaN(m.hook) ? '' : m.hook > 30 ? '\u2713 PASSING' : '\u2717 FAILING'}
+- Hold Rate: ${fmt(m.hold,'%')} (benchmark > 40%) ${isNaN(m.hold) ? '' : m.hold > 40 ? '\u2713 PASSING' : '\u2717 FAILING'}
+- CTI: ${fmt(m.cti,'%')} (benchmark > 20%) ${isNaN(m.cti) ? '' : m.cti > 20 ? '\u2713 PASSING' : '\u2717 FAILING'}
+- CPM: ${fmtR(m.cpm)} (benchmark < \u20b91500) ${isNaN(m.cpm) ? '' : m.cpm < 1500 ? '\u2713 PASSING' : '\u2717 FAILING'}
+- Installs: ${e.installs || 0} \u00b7 Spend: ${fmtR(ad.spend)}
+
+VERDICT: ${context}
+FAILING METRICS: ${failing || 'none'}
+PASSING METRICS: ${passing || 'none'}
 ${formatPastWinnersForPrompt(pastWinners)}
-## Verdict
-One line \u2014 **scale | iterate | kill** \u2014 and the single biggest reason.
+---
 
-## Snapshot (one observation per dimension)
-- **Hook (0:00-0:03):** what literally happens on screen + the craft choice driving it. [Hook]
-- **Hold (mid):** pacing, beat shape, where attention dips or spikes. [Hold]
-- **Script:** premise in one line + the strongest line in quotes with its timestamp.
-- **Visuals:** framing, cut density, b-roll quality, on-screen text, any production red flag.
-- **Voice modulation:** pitch / pause / emphasis pattern. Quote one moment that nails it or breaks it, with timestamp.
-- **Sound effects / music:** specific cues that lift or drag, with timestamps. Note mix issues.
-- **Topic / pain point:** the exact life situation it taps.
-- **Relatability:** the specific cohort it lands with \u2014 and who it misses.
+## \ud83c\udfaf One-Line Verdict
+**Scale / Iterate / Kill** \u2014 and the single biggest reason in one sentence.
 
-## Why it works
-3 bullets. Concrete craft choices with timestamps. Tag the metric each lifts.
+---
 
-## Why it's losing
-3 bullets. Each with a timestamp + the failing metric. For misspeaks/accent/mix issues, name the exact word.
+## \u2705 Why This Video Worked
+*(Only fill this if there are genuine strengths \u2014 skip bullets that don't apply)*
 
-## Fix list (timestamped)
-4-6 bullets. Each: \`timestamp\` + exact change (replace / add / cut / reframe \u2014 say which). For rewrites, give the new line in quotes. Tie each fix to the metric it should move.
+- **Hook mechanic** `[timestamp]`: What specifically happens in the first 3 seconds that stops the scroll. Name the visual or audio trigger and why it works for this audience. Tag: [Hook Rate]
+- **Emotional hook** `[timestamp]`: The exact pain point or desire this script taps \u2014 quote the line that lands it. Why does this cohort feel seen? Tag: [Hold Rate / CTI]
+- **Script structure**: What story shape does this follow (problem \u2192 proof \u2192 CTA / curiosity loop / identity trigger / etc.)? Quote the line that does the most work with its timestamp.
+- **Pacing / editing**: Where does the cut rhythm match the emotional beat? Name the specific moment. Tag: [Hold Rate]
+- **Visual storytelling**: One specific frame, overlay, or b-roll choice that earns its place. Timestamp + why it works. Tag: [Hook / Hold]
+- **Voice / delivery**: Quote one line where tone, pause, or emphasis drives the emotion. Timestamp + what the delivery does to viewer trust. Tag: [CTI]
+- **CTA**: What is the exact ask, does it feel earned at that point in the video, and why does it convert? Tag: [CTI / CPI]
 
-## 3 variations to test next
-1. **Cut variation** [Hold] \u2014 specific new in/out points or b-roll splice.
-2. **Script variation** [CTI] \u2014 exact rewrite of the key line in quotes.
-3. **CTA / end-card variation** [CTI] \u2014 different ask, urgency, or proof element.`;
+---
+
+## \u274c Why It's Underperforming / What's Holding It Back
+*(Be forensic. If a metric is failing, there is a specific craft reason \u2014 find it)*
+
+- **Hook problem** (if Hook Rate failing) `[0:00\u20130:03]`: Exactly what fails in the first 3 seconds \u2014 quote or describe frame by frame. What would make a thumb stop here?
+- **Drop-off point** (if Hold Rate failing) `[timestamp]`: The exact moment viewers leave \u2014 what's happening on screen/audio at that second and why attention breaks.
+- **Script weakness** `[timestamp]`: The line or section that loses credibility, feels generic, or slows the story. Quote it verbatim.
+- **Delivery issue** `[timestamp]`: Any misread, flat delivery, accent drop, or pacing drag. Quote the exact word or phrase.
+- **Visual/production issue** `[timestamp]`: Shaky frame, bad cut, low-quality b-roll, unreadable text overlay, or audio mix problem. Be specific.
+- **CTA weakness** (if CTI failing) `[timestamp]`: Why doesn't the end convert \u2014 too soft, too sudden, no urgency, wrong ask?
+
+---
+
+## \ud83d\udd27 Improvement Roadmap (Priority Order)
+*Highest-impact fix first. Each must be doable in a single edit session.*
+
+1. **[P1 \u2014 fixes ${failing ? failing.split(',')[0].trim() : 'biggest metric'}]** `[timestamp]` \u2192 Exact change: replace / cut / add / rerecord. If a script rewrite: give the new line in quotes. Expected metric move.
+2. **[P2]** `[timestamp]` \u2192 Same format.
+3. **[P3]** `[timestamp]` \u2192 Same format.
+4. **[P4 \u2014 optional if time allows]** `[timestamp]` \u2192 Same format.
+
+---
+
+## \ud83e\udde0 The Formula (extract for reuse)
+In 2-3 sentences: what is the repeatable pattern in this ad that should be carried into every future variation? Name the hook type, the story structure, and the CTA mechanic \u2014 so the next editor can replicate the working parts without guessing.`;
 }
 
 // Headless video upload to Gemini File API. Reports progress via callback.
