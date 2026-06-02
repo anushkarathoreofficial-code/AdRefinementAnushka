@@ -163,7 +163,8 @@
   @media (max-width:720px)  { .cards-grid { grid-template-columns:1fr; } }
 
   /* Card — calmer borders, no hover glow. Border-only hover state. */
-  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; transition:border-color .15s; }
+  .card { background:var(--surface); border:1px solid var(--border); border-radius:10px; overflow:hidden; transition:border-color .15s, background-color .15s; cursor:pointer; }
+  .card:hover { border-color:var(--text-dim); background:var(--surface2); }
   .card:hover { border-color:rgba(240,223,32,.3); }
 
   .card-header { padding:12px 14px; display:flex; gap:12px; align-items:center; border-bottom:1px solid var(--border); }
@@ -2066,7 +2067,12 @@ function renderDashboard() {
     const durBadge = ad.metaDuration > 0
       ? `<span class="thumb-duration" style="position:absolute; bottom:3px; right:3px; background:rgba(0,0,0,0.7); color:#fff; font-size:9px; font-weight:600; padding:1px 4px; border-radius:3px; pointer-events:none;">${_formatDuration(ad.metaDuration)}</span>`
       : '';
-    const thumbHTML = `<div style="position:relative; display:inline-block; line-height:0;">${innerThumb}${durBadge}</div>`;
+    // Wrapper must keep flex-shrink:0 (otherwise the thumb collapses in the
+    // flex card-header), match the thumb's 64x64 dimensions, AND forward
+    // clicks to openModal — the inner img already has onclick but a flat
+    // card-thumb-placeholder doesn't, and we want the badge-overlapped
+    // area clickable too.
+    const thumbHTML = `<div style="position:relative; width:64px; height:64px; flex-shrink:0; line-height:0; cursor:pointer;"${previewable ? ` onclick="openModal(${ad.id})"` : ''}>${innerThumb}${durBadge}</div>`;
 
     // Preview button removed — the entire thumbnail is the click target now,
     // matching the "tap the image to play" mental model and reducing button
@@ -3448,15 +3454,19 @@ document.getElementById('sortSelect').addEventListener('change', renderDashboard
 document.getElementById('previewModal').addEventListener('click', function(e) { if (e.target === this) closeModal(); });
 document.addEventListener('keydown', function(e) { if (e.key === 'Escape') closeModal(); });
 
-// In list view, clicking anywhere on the row (except the checkbox) opens
-// the preview modal. Grid view keeps its existing thumbnail/button onclicks.
+// Clicking anywhere on the card opens the preview modal — in both grid
+// AND list view. The explicit "Preview" button was removed in favor of
+// this whole-card click target, so we need to cover the title / metrics
+// area too, not just the thumbnail.
+// Guards: don't hijack clicks on buttons (Download, + Workflow), the
+// checkbox (selection), or any other native interactive element — those
+// keep their own behaviour. Thumbnail elements have their own onclick
+// that calls openModal directly, but openModal is idempotent so a
+// double-fire is harmless.
 document.getElementById('cardsGrid').addEventListener('click', function(e) {
-  if (!document.body.classList.contains('list-view')) return;
   const card = e.target.closest('.card');
   if (!card || !card.dataset.adId) return;
-  // Don't hijack clicks on the checkbox (selection) or the thumbnail
-  // (which has its own openModal handler — letting it run would double-fire).
-  if (e.target.closest('input.card-select, .card-thumb, .card-thumb-placeholder')) return;
+  if (e.target.closest('button, a, input, select, textarea, label')) return;
   openModal(parseInt(card.dataset.adId));
 });
 
