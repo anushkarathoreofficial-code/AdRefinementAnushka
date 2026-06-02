@@ -4170,7 +4170,10 @@ function renderVariationsPanel(seedAdId) {
   // seedNorm was computed at the top of this function (used for the
   // matches+pending empty-check). Reusing it here.
   const pendingRows = [];
-  let pendingCounter = matches.length;
+  // pendingSeq mirrors how live rows assign sequential badges (V1, V2, V3).
+  // Starts at matches.length so the first pending row always claims the next
+  // position: if 3 live ads exist → pendingSeq starts at 3 → first pending = V4.
+  let pendingSeq = matches.length;
   for (const wf of workflowItems || []) {
     if (!wf || !Array.isArray(wf.variations) || !wf.variations.length) continue;
     // Match workflow items by normalized name — accommodates "Copy" suffix,
@@ -4179,22 +4182,28 @@ function renderVariationsPanel(seedAdId) {
     for (const v of wf.variations) {
       const vNum = String(v.variationNum || '').trim();
       if (!vNum) continue;
-      // Skip variations that already exist as live ads in this panel.
-      const isLive = matches.some(m => {
-        const liveNum = getVariantNumber(m.ad.name);
-        return liveNum && ('v' + liveNum).toLowerCase() === vNum.toLowerCase();
-      });
+      // Claim the next sequential position for this pending slot.
+      pendingSeq++;
+      // Skip if a live ad with this exact V-number has already appeared —
+      // means the editor delivered and the live version is now in the panel.
+      // Use _extractAnyVariantNum so pipe-format names like
+      // "Mailbox AI | V4 - Cut 4 | ..." are detected correctly.
+      const isLive = matches.some(m => _extractAnyVariantNum(m.ad.name) === pendingSeq);
       if (isLive) continue;
-      pendingCounter++;
+      // Use position-based display number (V4, V5, …) — consistent with how
+      // live rows show sequential V1/V2/V3 badges regardless of the V-marker
+      // embedded in the ad name. This also corrects old workflow items that
+      // were saved with the wrong variationNum before the regex fix.
+      const displayVNum = 'v' + pendingSeq;
       const brief = String(v.text || '').replace(/\s+/g, ' ').trim();
       const briefShort = brief.length > 90 ? brief.slice(0, 87) + '…' : brief;
       const editor = v.editor ? ` · ${v.editor}` : '';
-      // Render the renamed-for-variation name so the pending row visually
-      // matches the row that lands in the sheet — both show "V4" instead
-      // of the seed's "V1".
-      const displayName = renameAdForVariation(seedAd.name, vNum);
+      // Rename the seed ad's name with the correct position-based V-number so
+      // the pending row shows "Mailbox AI | V4 - Cut 3 | ..." — matching what
+      // the sheet row should (and going forward will) contain.
+      const displayName = renameAdForVariation(seedAd.name, displayVNum);
       pendingRows.push(`<div class="variation-row" style="opacity:.78; border:1px dashed var(--border);" title="In progress — will be replaced when the live ad appears">
-        <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${vNum.toUpperCase()}</span>
+        <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${displayVNum.toUpperCase()}</span>
         <div class="var-thumb-placeholder" style="background:var(--surface2); color:var(--text-dim);">⏳</div>
         <div class="var-name" style="display:flex; flex-direction:column; gap:2px;">
           <div style="color:var(--text); font-weight:500;">${escHtml(displayName)}</div>
@@ -5562,6 +5571,15 @@ function getNextVariationNum(item) {
   return 'v' + (maxN + 1);
 }
 
+// Extract a V-number from ANYWHERE in the name — not just end-of-string.
+// getVariantNumber() anchors with $ so it matches "_v1" suffix format but
+// misses pipe-separated names like "Mailbox AI | V3 - Cut 3 | ...".
+// This helper is used wherever we need to read the V-marker from Meta ad names.
+function _extractAnyVariantNum(name) {
+  const m = String(name || '').match(/\b(v|ver|version)\s*(\d+)\b/i);
+  return m ? parseInt(m[2], 10) : 0;
+}
+
 // Like getNextVariationNum, but looks at BOTH live ads in this ad's
 // variant group (V1/V2/V3 already running on Meta) AND any existing
 // workflow items for it. So if the editor opens "+ Workflow" on V3 and
@@ -5570,11 +5588,14 @@ function getNextVariationNum(item) {
 function getNextVariationNumForAd(ad) {
   if (!ad) return 'v1';
   let maxN = 0;
-  // Live ads in the same variant group.
+  // Live ads in the same variant group. Use _extractAnyVariantNum so
+  // pipe-format names ("Mailbox AI | V3 - Cut 3 | ...") are read correctly.
+  // The old getVariantNumber() anchors at end-of-string ($) and returns 0
+  // for every pipe-format name, causing the next-var default to stay v1.
   try {
     const liveMatches = findVariations(ad) || [];
     for (const m of liveMatches) {
-      const n = getVariantNumber(m.ad.name);
+      const n = _extractAnyVariantNum(m.ad.name);
       if (n > maxN) maxN = n;
     }
   } catch (_) { /* findVariations not in scope yet during boot — fine */ }
