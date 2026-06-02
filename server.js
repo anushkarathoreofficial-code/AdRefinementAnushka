@@ -989,6 +989,18 @@ function extractThumbnail(creative) {
 }
 
 // ---------------- Meta API: full ad-level insights as CSV ----------------
+// Cached per (workspace, date_preset, campaign filter) for 10 minutes.
+// Bypassed when the client sends ?fresh=1 (the manual "↻ Refresh data"
+// button does this). Multiple users hitting Lumus at the same time of day
+// pay the Meta cost once.
+const _insightsCache = new Map();
+const INSIGHTS_CACHE_TTL_MS = 10 * 60 * 1000;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of _insightsCache) if (v.expiresAt <= now) _insightsCache.delete(k);
+}, 5 * 60 * 1000).unref();
+
 app.get('/api/meta-insights.csv', async (req, res) => {
   const token = process.env.META_TOKEN;
   const ws = getWorkspace(req.query.workspace);
@@ -997,6 +1009,22 @@ app.get('/api/meta-insights.csv', async (req, res) => {
       .send('Workspace not configured: set META_TOKEN and a workspace ad_account.');
   }
   const datePreset = sanitizeDatePreset(req.query.date_preset || process.env.META_DATE_PRESET);
+
+  // Cache-key components must include any param that changes the response.
+  const campaignIdsForKey = (req.query.campaign_ids || ws.campaign_ids || '').trim();
+  const cacheKey = ws.id + '|' + datePreset + '|' + campaignIdsForKey;
+  const wantsFresh = req.query.fresh === '1' || req.query.fresh === 'true';
+  if (!wantsFresh) {
+    const hit = _insightsCache.get(cacheKey);
+    if (hit && hit.expiresAt > Date.now()) {
+      res.set('Cache-Control', 'no-store');
+      res.set('X-Requested-Date-Preset', datePreset);
+      res.set('X-Effective-Date-Preset', hit.effectivePreset);
+      res.set('X-Cache', 'HIT');
+      res.type('text/csv').send(hit.csv);
+      return;
+    }
+  }
   const fields = [
     'ad_id','ad_name','adset_name','campaign_id','campaign_name',
     'spend','impressions','reach','frequency',
@@ -1125,7 +1153,17 @@ app.get('/api/meta-insights.csv', async (req, res) => {
     // from the requested preset.
     res.set('X-Requested-Date-Preset', datePreset);
     res.set('X-Effective-Date-Preset', effectivePreset);
-    res.type('text/csv').send(buildInsightsCSV(rows, createdTimes));
+    res.set('X-Cache', 'MISS');
+    const csv = buildInsightsCSV(rows, createdTimes);
+    // Stash for the next 10 minutes — keyed on (workspace, preset,
+    // campaign filter). Any user hitting the same combination skips
+    // Meta entirely.
+    _insightsCache.set(cacheKey, {
+      csv,
+      effectivePreset,
+      expiresAt: Date.now() + INSIGHTS_CACHE_TTL_MS
+    });
+    res.type('text/csv').send(csv);
   } catch (err) {
     res.status(502).type('text/plain').send('Meta API fetch failed.');
   }

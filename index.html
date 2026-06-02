@@ -1194,14 +1194,85 @@ function renderWorkspaceTabs() {
   });
 }
 
+// Per-workspace state snapshots. Lets a tab-switch restore the
+// previously-loaded ads/links/creative-cache in ~50ms instead of going
+// back to Meta every time. Snapshot is rebuilt every time the user
+// returns to a tab, so it always reflects what was last seen.
+//
+// Refreshing manually (↻ Refresh data) bypasses the snapshot for the
+// current workspace — clears it so the next switch will go fetch again.
+const _workspaceSnapshots = new Map();
+const WORKSPACE_SNAPSHOT_TTL_MS = 10 * 60 * 1000; // 10 min
+
+function _snapshotCurrentWorkspace() {
+  if (!currentWorkspaceId || !metaCSVLoaded || !allAds.length) return;
+  _workspaceSnapshots.set(currentWorkspaceId, {
+    ads:                 allAds,
+    linkMap:             linkMap,
+    linksLoaded:         linksLoaded,
+    metaCSVLoaded:       metaCSVLoaded,
+    aiCache:             aiCache,
+    metaCreative:        new Map(_metaCreativeCache),
+    metaCreativeFailed:  new Set(_metaCreativeFailed),
+    metaCreativeErrors:  new Map(_metaCreativeErrors),
+    storedAnalysisProbed:new Set(_storedAnalysisProbed),
+    effectiveDatePreset: _effectiveDatePreset,
+    requestedDatePreset: _requestedDatePreset,
+    loadedAt:            Date.now()
+  });
+}
+
+function _restoreWorkspaceSnapshot(id) {
+  const snap = _workspaceSnapshots.get(id);
+  if (!snap) return false;
+  if (Date.now() - snap.loadedAt > WORKSPACE_SNAPSHOT_TTL_MS) {
+    // Expired — clear and force a refetch.
+    _workspaceSnapshots.delete(id);
+    return false;
+  }
+  allAds          = snap.ads;
+  linkMap         = snap.linkMap;
+  linksLoaded     = snap.linksLoaded;
+  metaCSVLoaded   = snap.metaCSVLoaded;
+  aiCache         = snap.aiCache;
+  _metaCreativeCache.clear();
+  for (const [k, v] of snap.metaCreative) _metaCreativeCache.set(k, v);
+  _metaCreativeFailed.clear();
+  for (const k of snap.metaCreativeFailed) _metaCreativeFailed.add(k);
+  _metaCreativeErrors.clear();
+  for (const [k, v] of snap.metaCreativeErrors) _metaCreativeErrors.set(k, v);
+  _storedAnalysisProbed.clear();
+  for (const k of snap.storedAnalysisProbed) _storedAnalysisProbed.add(k);
+  _effectiveDatePreset = snap.effectiveDatePreset;
+  _requestedDatePreset = snap.requestedDatePreset;
+  return true;
+}
+
 async function switchWorkspace(id) {
   if (!id || id === currentWorkspaceId) return;
   const target = BACKEND.workspaces.find(w => w.id === id);
   if (!target) return;
+
+  // 1. Save the workspace we're leaving so we can pop back to it instantly
+  //    next time the user clicks its tab.
+  _snapshotCurrentWorkspace();
+
   currentWorkspaceId = id;
   try { localStorage.setItem(WORKSPACE_STORAGE_KEY, id); } catch (_) {}
-  // Clear all the in-session state that's workspace-specific so the new
-  // tab's data doesn't get blended with the old tab's leftovers.
+
+  // 2. Try to restore from a fresh snapshot for the new workspace.
+  if (_restoreWorkspaceSnapshot(id)) {
+    // Hot-path: rendered in ~ms, no network. Re-render the chrome so the
+    // badge / tab strip / data-source pill match the restored workspace,
+    // then re-launch the dashboard from in-memory data.
+    _metaCreativeInflight.clear(); // can't restore in-flight promises
+    renderWorkspaceTabs();
+    updateDataSourceBadge();
+    launchDashboard();
+    return;
+  }
+
+  // 3. Cold-path: reset workspace-scoped state, then go fetch.
   allAds = [];
   linkMap = {};
   linksLoaded = false;
@@ -1816,7 +1887,10 @@ async function loadFromBackend() {
     // multi-workspace mode — single-workspace deployments keep clean URLs.
     let metaSrc = BACKEND.metaApiUrl || BACKEND.metaCsvUrl;
     if (BACKEND.metaApiUrl) metaSrc = withWorkspace(metaSrc);
-    const metaUrl = metaSrc + sep(metaSrc) + 'cb=' + Date.now();
+    // cb defeats browser HTTP cache; fresh=1 defeats our server cache (only
+    // set on explicit Refresh-data clicks, not the routine auto-refresh).
+    const freshParam = _forceFreshLoad ? '&fresh=1' : '';
+    const metaUrl = metaSrc + sep(metaSrc) + 'cb=' + Date.now() + freshParam;
 
     // Links source priority:
     //   1. /api/links.csv?workspace=<id> when this workspace has a sheet_id
@@ -1958,11 +2032,20 @@ async function refreshData() {
   const btn = document.getElementById('btnRefreshData');
   if (btn) { btn.disabled = true; btn.textContent = '↻ Refreshing…'; }
   try {
+    // Manual refresh = drop the client snapshot for this workspace AND
+    // bypass the server cache. _forceFreshLoad is read by loadFromBackend
+    // and appended as ?fresh=1 to the Meta CSV URL.
+    if (currentWorkspaceId) _workspaceSnapshots.delete(currentWorkspaceId);
+    _forceFreshLoad = true;
     await loadFromBackend();
   } finally {
+    _forceFreshLoad = false;
     if (btn) { btn.disabled = false; btn.textContent = '↻ Refresh data'; }
   }
 }
+// Module-scope flag the next loadFromBackend() call reads to decide whether
+// to add ?fresh=1 to the meta-insights URL (busting the server cache).
+let _forceFreshLoad = false;
 
 // ============ RENDERING ============
 function renderAll() {
