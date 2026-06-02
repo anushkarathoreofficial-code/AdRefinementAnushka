@@ -4202,8 +4202,6 @@ function renderVariationsPanel(seedAdId) {
       const briefShort = brief.length > 90 ? brief.slice(0, 87) + '…' : brief;
       const editor = v.editor ? ` · ${v.editor}` : '';
       const displayName = renameAdForVariation(seedAd.name, displayVNum);
-      // Safe JSON-encode the adName for inline onclick — handles quotes/special chars.
-      const safeWfName = JSON.stringify(wf.adName || '');
       pendingRows.push(`<div class="variation-row" style="opacity:.78; border:1px dashed var(--border);" title="In progress — will be replaced when the live ad appears">
         <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${displayVNum.toUpperCase()}</span>
         <div class="var-thumb-placeholder" style="background:var(--surface2); color:var(--text-dim);">⏳</div>
@@ -4213,7 +4211,7 @@ function renderVariationsPanel(seedAdId) {
         </div>
         <div class="var-metrics" style="display:flex; align-items:center; gap:8px; flex-shrink:0;">
           <span style="font-size:10px; color:var(--text-dim); font-style:italic;">pending — no metrics yet</span>
-          <button onclick="deletePendingVariation(${safeWfName}, ${vIdx}); event.stopPropagation();" style="background:none; border:1px solid var(--border); color:var(--text-dim); border-radius:4px; cursor:pointer; padding:1px 7px; font-size:13px; line-height:1.3; flex-shrink:0;" title="Delete this pending variation">×</button>
+          <button data-wf-name="${escHtml(wf.adName || '')}" data-v-idx="${vIdx}" onclick="deletePendingVariation(this.dataset.wfName, parseInt(this.dataset.vIdx)); event.stopPropagation();" style="background:none; border:1px solid var(--border); color:var(--text-dim); border-radius:4px; cursor:pointer; padding:1px 7px; font-size:13px; line-height:1.3; flex-shrink:0;" title="Delete this pending variation">×</button>
         </div>
       </div>`);
     }
