@@ -5765,10 +5765,6 @@ function openSuggestionModal(ad) {
         ${varHistory}
         <div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:12px;">
           <div>
-            <label style="font-size:10px; color:var(--text-dim); display:block; margin-bottom:3px;">Ad / Idea Num</label>
-            <input type="text" id="sugIdeaNum" placeholder="e.g. Idea 120" value="${escHtml(existing?.ideaNum || '')}" style="width:100%; padding:7px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:12px;">
-          </div>
-          <div>
             <label style="font-size:10px; color:var(--text-dim); display:block; margin-bottom:3px;">Variation Num</label>
             <input type="text" id="sugVarNum" value="${escHtml(nextVar)}" style="width:100%; padding:7px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:12px;">
           </div>
@@ -5777,15 +5773,6 @@ function openSuggestionModal(ad) {
             <select id="sugEditor" style="width:100%; padding:7px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:12px;">
               <option value="">\u2014 Select editor \u2014</option>
               ${editorOpts}
-            </select>
-          </div>
-          <div>
-            <label style="font-size:10px; color:var(--text-dim); display:block; margin-bottom:3px;">Platform</label>
-            <select id="sugPlatform" style="width:100%; padding:7px 10px; border-radius:6px; border:1px solid var(--border); background:var(--surface2); color:var(--text); font-size:12px;">
-              <option value="Astrotalk" ${(existing?.platform || 'Astrotalk') === 'Astrotalk' ? 'selected' : ''}>Astrotalk</option>
-              <option value="Astrotalk Lite" ${existing?.platform === 'Astrotalk Lite' ? 'selected' : ''}>Astrotalk Lite</option>
-              <option value="Astrotalk Pro" ${existing?.platform === 'Astrotalk Pro' ? 'selected' : ''}>Astrotalk Pro</option>
-              <option value="Other" ${existing?.platform === 'Other' ? 'selected' : ''}>Other</option>
             </select>
           </div>
         </div>
@@ -5821,10 +5808,10 @@ async function submitSuggestion(adId) {
   if (!ad) { closeSuggestionModal(); return; }
   const text = document.getElementById('sugText').value.trim();
   if (!text) { document.getElementById('sugStatus').innerHTML = '<span style="color:var(--red);">Write a suggestion first.</span>'; return; }
-  const ideaNum = document.getElementById('sugIdeaNum').value.trim();
+  const ideaNum = document.getElementById('sugIdeaNum')?.value.trim() || '';
   const variationNum = document.getElementById('sugVarNum').value.trim() || 'v1';
-  const editorName = document.getElementById('sugEditor').value;  // stores the name now
-  const platform = document.getElementById('sugPlatform').value;
+  const editorName = document.getElementById('sugEditor').value;
+  const platform = document.getElementById('sugPlatform')?.value || '';
   const pushSheet = document.getElementById('sugPushSheet').checked;
   const notifySlack = document.getElementById('sugNotifySlack').checked;
   const editor = editors.find(e => e.name === editorName);
