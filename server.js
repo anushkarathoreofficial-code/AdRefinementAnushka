@@ -886,12 +886,19 @@ app.get('/api/ad-creative', async (req, res) => {
     let thumb     = extractThumbnail(creative);
 
     let videoUrl = '';
+    let durationSec = 0;
     if (videoId) {
+      // ?fields=source,length grabs both the playable URL and the duration
+      // in seconds in one call — the duration is shown as a small badge
+      // on the card thumbnail so editors can see length without opening it.
       const vidUrl = `https://graph.facebook.com/v21.0/${encodeURIComponent(videoId)}` +
-                     `?fields=source&access_token=${encodeURIComponent(token)}`;
+                     `?fields=source,length&access_token=${encodeURIComponent(token)}`;
       const vidRes = await fetchWithTimeout(vidUrl);
       const vidData = await vidRes.json();
-      if (vidRes.ok && !vidData.error && vidData.source) videoUrl = vidData.source;
+      if (vidRes.ok && !vidData.error) {
+        if (vidData.source) videoUrl = vidData.source;
+        if (vidData.length != null) durationSec = parseFloat(vidData.length) || 0;
+      }
     }
 
     // Many promoted-post-style video ads don't expose video_id anywhere on
@@ -916,7 +923,10 @@ app.get('/api/ad-creative', async (req, res) => {
     const data = {
       video_url: videoUrl,
       thumbnail_url: thumb,
-      image_url: creative.image_url || ''
+      image_url: creative.image_url || '',
+      // Duration in seconds (decimal). Client renders it as e.g. "0:24" in
+      // the corner of the thumbnail. 0 = unknown / not a video ad.
+      duration_sec: durationSec
     };
     creativeCache.set(adId, { data, expiresAt: Date.now() + CREATIVE_TTL_MS });
     res.json(data);

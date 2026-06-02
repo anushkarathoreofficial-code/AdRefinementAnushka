@@ -929,7 +929,8 @@
           </div>
           <div style="display:flex; gap:6px; align-items:center; flex-wrap:wrap;">
             <button class="btn btn-ai" id="btnAnalyzeVideo" onclick="triggerVideoUpload()" style="background:var(--accent-bg); color:var(--accent); border-color:rgba(240,223,32,.3);">Full Video Analysis</button>
-            <button class="btn btn-ai" id="btnGenerateVariations" onclick="generateVariations()" title="Watches this ad and proposes 3 variations: similar-script, cut/edit, CTA">Generate Variations</button>
+            <button class="btn btn-ai" id="btnGenerateVariations" onclick="generateVariations()" title="Watches this ad and proposes 3 variations: similar-script, cut/edit, CTA">AI Variation</button>
+            <button class="btn" id="btnModalWorkflow" onclick="modalSendToWorkflow()" style="background:var(--accent-bg); color:var(--accent);" title="Send this ad to the variation workflow (creates a row in the Variation sheet)">+ Workflow</button>
           </div>
         </div>
 
@@ -1055,6 +1056,7 @@ async function _fetchAdCreativeIfNeeded(ad) {
         if (a.adId === ad.adId) {
           a.metaVideo = data.video_url || '';
           a.metaThumb = data.thumbnail_url || data.image_url || '';
+          a.metaDuration = Number(data.duration_sec) || 0;
         }
       }
     } catch (e) {
@@ -1669,8 +1671,9 @@ function parseMetaCSV(text) {
     const cachedCreative = adId ? _metaCreativeCache.get(adId) : null;
     const metaVideo = cachedCreative ? cachedCreative.video_url : '';
     const metaThumb = cachedCreative ? (cachedCreative.thumbnail_url || cachedCreative.image_url) : '';
+    const metaDuration = cachedCreative ? (Number(cachedCreative.duration_sec) || 0) : 0;
 
-    ads.push({ name, metrics, passed, failed, score, link, impressions, spend, extra, id: idx + 1, linkMatch, adId, metaVideo, metaThumb });
+    ads.push({ name, metrics, passed, failed, score, link, impressions, spend, extra, id: idx + 1, linkMatch, adId, metaVideo, metaThumb, metaDuration });
   });
 
   return ads;
@@ -1885,6 +1888,16 @@ async function loadFromBackend() {
 let _requestedDatePreset = '';
 let _effectiveDatePreset = '';
 
+// Format a duration in seconds as m:ss for the thumbnail badge.
+// 24s → "0:24", 67s → "1:07", 125s → "2:05". Rounds down to whole seconds
+// so a 24.7s clip reads as 0:24, not 0:25.
+function _formatDuration(seconds) {
+  const s = Math.max(0, Math.floor(Number(seconds) || 0));
+  const m = Math.floor(s / 60);
+  const rs = s % 60;
+  return m + ':' + (rs < 10 ? '0' : '') + rs;
+}
+
 function _presetLabel(p) {
   return ({
     maximum: 'lifetime',
@@ -2038,7 +2051,7 @@ function renderDashboard() {
     // Thumbnail priority: Meta thumb > Drive thumb > folder placeholder >
     // generic placeholder. Meta wins because Drive thumbnails fail silently
     // for files shared with restricted access \u2014 Meta's CDN is universal.
-    const thumbHTML = ad.metaThumb
+    const innerThumb = ad.metaThumb
       ? `<img class="card-thumb" src="${ad.metaThumb}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
       : fileId
         ? `<img class="card-thumb" src="${BACKEND.driveProxyEnabled ? '/api/drive-thumbnail?file_id=' + fileId : 'https://drive.google.com/thumbnail?id=' + fileId + '&sz=w200'}" alt="" onclick="openModal(${ad.id})" onerror="this.outerHTML='<div class=\\'card-thumb-placeholder\\' onclick=\\'openModal(${ad.id})\\'>\u25B6</div>'">`
@@ -2046,7 +2059,20 @@ function renderDashboard() {
           ? `<div class="card-thumb-placeholder" data-folder-id="${folderId}" data-ad-id="${ad.id}" onclick="openModal(${ad.id})">\u25B6</div>`
           : `<div class="card-thumb-placeholder" ${previewable ? `onclick="openModal(${ad.id})"` : ''}>\u25B6</div>`;
 
-    const previewBtn = previewable ? `<button class="btn btn-preview" onclick="openModal(${ad.id})">Preview</button>` : '';
+    // Duration badge over the bottom-right corner of the thumbnail.
+    // Only shown when we know the duration (Meta returned a video.length
+    // value). Falls through silently for image-only ads or until Meta
+    // creative resolution completes.
+    const durBadge = ad.metaDuration > 0
+      ? `<span class="thumb-duration" style="position:absolute; bottom:3px; right:3px; background:rgba(0,0,0,0.7); color:#fff; font-size:9px; font-weight:600; padding:1px 4px; border-radius:3px; pointer-events:none;">${_formatDuration(ad.metaDuration)}</span>`
+      : '';
+    const thumbHTML = `<div style="position:relative; display:inline-block; line-height:0;">${innerThumb}${durBadge}</div>`;
+
+    // Preview button removed — the entire thumbnail is the click target now,
+    // matching the "tap the image to play" mental model and reducing button
+    // clutter. previewable still drives whether the thumbnail itself is
+    // clickable for ads we can't preview at all.
+    const previewBtn = '';
     const downloadBtn = fileId ? `<button class="btn" style="background:var(--blue-bg); color:var(--blue);" onclick="downloadDriveVideo('${fileId}', '${ad.name.replace(/['\\]/g, '')}')">\u2B07 Download</button>` : '';
     const aiBtn = ''; // per-card AI Analysis (thumbnail) button removed — use modal's Generate Variations / Full Video Analysis instead
     const wfBtn = ad.score < 5 ? `<button class="btn" style="background:var(--accent-bg); color:var(--accent);" onclick="sendToWorkflow(${ad.id})">+ Workflow</button>` : '';
@@ -3987,7 +4013,15 @@ function renderVariationsPanel(seedAdId) {
   const seedAd = allAds.find(a => a.id === seedAdId);
   if (!seedAd) return '';
   const matches = findVariations(seedAd);
-  if (!matches.length) return '';
+  // Only bail out when BOTH live variations AND pending workflow rows are
+  // empty. A solo ad with one in-progress "+ Workflow" submission should
+  // still surface that row so the editor can see their request landed.
+  const seedNorm = normalizeAdName(seedAd.name);
+  const hasPending = (workflowItems || []).some(wf =>
+    wf && Array.isArray(wf.variations) && wf.variations.length &&
+    normalizeAdName(wf.adName || '') === seedNorm
+  );
+  if (!matches.length && !hasPending) return '';
 
   const metricKeys = ['cpi','hold','hook','cti','cpm'];
   const rows = matches.map((m, i) => {
@@ -4030,13 +4064,55 @@ function renderVariationsPanel(seedAdId) {
     : `<span class="var-hint">Differing only by V/cut · ranked by CPI low → high</span>`;
   const titleBadge = isManual ? ' <span style="font-size:9px; color:var(--accent); background:var(--accent-bg); padding:1px 5px; border-radius:3px; margin-left:4px; vertical-align:middle;">manual</span>' : '';
 
+  // ----- Pending workflow variations -----
+  // For any "+ Workflow" submissions on this ad whose variation hasn't yet
+  // materialized as a live Meta ad, render a placeholder row at the bottom
+  // of the list. Editors see "v4 in progress" while they're producing it;
+  // the row vanishes automatically the moment a live ad with that variation
+  // number shows up in allAds (next Meta sync).
+  // seedNorm was computed at the top of this function (used for the
+  // matches+pending empty-check). Reusing it here.
+  const pendingRows = [];
+  let pendingCounter = matches.length;
+  for (const wf of workflowItems || []) {
+    if (!wf || !Array.isArray(wf.variations) || !wf.variations.length) continue;
+    // Match workflow items by normalized name — accommodates "Copy" suffix,
+    // emoji prefix, case differences. Same matcher used elsewhere.
+    if (normalizeAdName(wf.adName || '') !== seedNorm) continue;
+    for (const v of wf.variations) {
+      const vNum = String(v.variationNum || '').trim();
+      if (!vNum) continue;
+      // Skip variations that already exist as live ads in this panel.
+      const isLive = matches.some(m => {
+        const liveNum = getVariantNumber(m.ad.name);
+        return liveNum && ('v' + liveNum).toLowerCase() === vNum.toLowerCase();
+      });
+      if (isLive) continue;
+      pendingCounter++;
+      const brief = String(v.text || '').replace(/\s+/g, ' ').trim();
+      const briefShort = brief.length > 90 ? brief.slice(0, 87) + '…' : brief;
+      const editor = v.editor ? ` · ${v.editor}` : '';
+      pendingRows.push(`<div class="variation-row" style="opacity:.78; border:1px dashed var(--border);" title="In progress — will be replaced when the live ad appears">
+        <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${vNum.toUpperCase()}</span>
+        <div class="var-thumb-placeholder" style="background:var(--surface2); color:var(--text-dim);">⏳</div>
+        <div class="var-name" style="display:flex; flex-direction:column; gap:2px;">
+          <div style="color:var(--text); font-weight:500;">${escHtml(seedAd.name)}</div>
+          <div style="font-size:10px; color:var(--text-dim);">In progress${editor} · ${escHtml(briefShort) || 'no brief'}</div>
+        </div>
+        <div class="var-metrics"><span style="font-size:10px; color:var(--text-dim); font-style:italic;">pending — no metrics yet</span></div>
+      </div>`);
+    }
+  }
+
+  const totalCount = matches.length + pendingRows.length;
+
   return `
     <div class="variations-panel">
       <div class="var-header">
-        <span class="var-title">Variations<span class="var-count">${matches.length}</span>${titleBadge}</span>
+        <span class="var-title">Variations<span class="var-count">${totalCount}</span>${titleBadge}</span>
         ${hint}
       </div>
-      <div class="variations-list">${rows}</div>
+      <div class="variations-list">${rows}${pendingRows.join('')}</div>
     </div>`;
 }
 
@@ -5392,6 +5468,14 @@ function sendToWorkflow(adId) {
   openSuggestionModal(ad);
 }
 
+// Triggered by the "+ Workflow" button inside the ad-detail modal. Same
+// behaviour as the card-level button but always uses currentModalAdId so
+// the workflow modal opens for the ad you're currently looking at.
+function modalSendToWorkflow() {
+  if (currentModalAdId == null) return;
+  sendToWorkflow(currentModalAdId);
+}
+
 function openSuggestionModal(ad) {
   // Find existing item for this ad, if any
   const existingIdx = workflowItems.findIndex(w => w.adName === ad.name);
@@ -5564,6 +5648,14 @@ async function submitSuggestion(adId) {
   }
 
   renderWorkflow();
+  // If the user is currently looking at this ad's detail modal, re-render
+  // its Variations panel so the new pending row appears immediately —
+  // otherwise the suggestion would only show up after they re-opened the
+  // modal or hit refresh.
+  if (currentModalAdId != null) {
+    const c = document.getElementById('modalVariations');
+    if (c) c.innerHTML = renderVariationsPanel(currentModalAdId);
+  }
   closeSuggestionModal();
 
   // Flash the workflow tab
