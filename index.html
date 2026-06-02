@@ -4102,11 +4102,15 @@ function renderVariationsPanel(seedAdId) {
       const brief = String(v.text || '').replace(/\s+/g, ' ').trim();
       const briefShort = brief.length > 90 ? brief.slice(0, 87) + '…' : brief;
       const editor = v.editor ? ` · ${v.editor}` : '';
+      // Render the renamed-for-variation name so the pending row visually
+      // matches the row that lands in the sheet — both show "V4" instead
+      // of the seed's "V1".
+      const displayName = renameAdForVariation(seedAd.name, vNum);
       pendingRows.push(`<div class="variation-row" style="opacity:.78; border:1px dashed var(--border);" title="In progress — will be replaced when the live ad appears">
         <span class="v-badge" style="background:var(--accent-bg); color:var(--accent); border:1px solid rgba(240,223,32,.3);">${vNum.toUpperCase()}</span>
         <div class="var-thumb-placeholder" style="background:var(--surface2); color:var(--text-dim);">⏳</div>
         <div class="var-name" style="display:flex; flex-direction:column; gap:2px;">
-          <div style="color:var(--text); font-weight:500;">${escHtml(seedAd.name)}</div>
+          <div style="color:var(--text); font-weight:500;">${escHtml(displayName)}</div>
           <div style="font-size:10px; color:var(--text-dim);">In progress${editor} · ${escHtml(briefShort) || 'no brief'}</div>
         </div>
         <div class="var-metrics"><span style="font-size:10px; color:var(--text-dim); font-style:italic;">pending — no metrics yet</span></div>
@@ -5471,6 +5475,56 @@ function getNextVariationNum(item) {
   return 'v' + (maxN + 1);
 }
 
+// Like getNextVariationNum, but looks at BOTH live ads in this ad's
+// variant group (V1/V2/V3 already running on Meta) AND any existing
+// workflow items for it. So if the editor opens "+ Workflow" on V3 and
+// V1/V2/V3 are already live, the default jumps to V4 — not v1 as the
+// stale workflow-only logic returned.
+function getNextVariationNumForAd(ad) {
+  if (!ad) return 'v1';
+  let maxN = 0;
+  // Live ads in the same variant group.
+  try {
+    const liveMatches = findVariations(ad) || [];
+    for (const m of liveMatches) {
+      const n = getVariantNumber(m.ad.name);
+      if (n > maxN) maxN = n;
+    }
+  } catch (_) { /* findVariations not in scope yet during boot — fine */ }
+  // Pending workflow items keyed by ad.name.
+  const wfItem = workflowItems.find(w => w.adName === ad.name);
+  if (wfItem && Array.isArray(wfItem.variations)) {
+    for (const v of wfItem.variations) {
+      const m = String(v.variationNum || '').toLowerCase().match(/^v(\d+)$/);
+      if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
+    }
+  }
+  return 'v' + (maxN + 1);
+}
+
+// Rewrite an ad name so its embedded V-marker reflects a new variation
+// number. Editor wants the workflow row in the sheet (and the pending
+// row in the Variations panel) to show the upcoming name, not the seed.
+// Handles "Mailbox AI | V1 - Main | ..." → "Mailbox AI | V4 - Main | ...".
+// Removes any trailing "- Copy" / "- Copy 2" first so we don't accidentally
+// label the new variation as a copy of the previous one.
+function renameAdForVariation(name, newVarNum) {
+  if (!name) return name;
+  let n = String(name);
+  // Strip Meta's duplication-marker suffix.
+  while (true) {
+    const before = n;
+    n = n.replace(/\s*-\s*Copy(\s*\d+)?\s*$/i, '');
+    if (n === before) break;
+  }
+  const newToken = String(newVarNum || '').toUpperCase();
+  // Anywhere-in-the-string v-pattern, word-boundary-anchored so we don't
+  // chew into longer tokens (e.g. "v2x" stays intact).
+  const pat = /\b(v|ver|version)\s*\d+\b/i;
+  if (pat.test(n)) return n.replace(pat, newToken);
+  return n + ' - ' + newToken; // no v-marker in original — append one
+}
+
 function sendToWorkflow(adId) {
   const ad = allAds.find(a => a.id === adId);
   if (!ad) return;
@@ -5490,7 +5544,10 @@ function openSuggestionModal(ad) {
   // Find existing item for this ad, if any
   const existingIdx = workflowItems.findIndex(w => w.adName === ad.name);
   const existing = existingIdx >= 0 ? migrateWorkflowItem(workflowItems[existingIdx]) : null;
-  const nextVar = getNextVariationNum(existing);
+  // Use the ad-wide version (looks at live siblings + workflow history)
+  // so when V1/V2/V3 are already running on Meta, the default jumps to V4
+  // instead of starting fresh at V1.
+  const nextVar = getNextVariationNumForAd(ad);
   const editorOpts = editors.map(e => `<option value="${escHtml(e.name)}">${escHtml(e.name)}</option>`).join('');
   const varHistory = existing && existing.variations.length
     ? `<div style="background:var(--surface2); border-radius:6px; padding:8px 10px; margin-bottom:10px; font-size:11px;">
@@ -5624,10 +5681,16 @@ async function submitSuggestion(adId) {
   const useServerWorkflow = workspaceHasWorkflow();
   if (pushSheet && (useServerWorkflow || getSheetWebhook())) {
     statusEl.textContent = 'Sending to Google Sheet...';
+    // adName in the sheet row reflects the UPCOMING variation, not the
+    // seed. So "Mailbox AI | V1 - Main | ..." submitted as v4 writes
+    // "Mailbox AI | V4 - Main | ..." to the sheet — that's the name the
+    // editor will use when they upload the new cut to Meta, and matches
+    // the row a viewer naturally expects to see.
+    const renamedAdName = renameAdForVariation(ad.name, variationNum);
     const row = {
       date: todayLabel,
       ideaNum,
-      adName: ad.name,
+      adName: renamedAdName,
       scriptBy: currentUser || '',
       variationNum,           // column E, sheet header now "Variation Num"
       poc: variationNum,      // legacy key kept for backward compat with old Apps Script
